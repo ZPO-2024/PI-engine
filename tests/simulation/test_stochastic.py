@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta, timezone
+from hashlib import sha256
 from importlib import import_module
 from itertools import pairwise
+import json
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -36,6 +38,69 @@ def test_same_seed_reproduces_byte_equivalent_ensemble() -> None:
     )
 
     assert first.model_dump_json() == replay.model_dump_json()
+
+
+def test_rng_scheme_versions_ids_and_provenance_against_legacy_payload() -> None:
+    """Changing stream semantics must not preserve legacy artifact identities."""
+    fixture = stochastic_branching(seed=7)
+    stochastic = import_module("pi_engine.simulation.stochastic")
+    ensemble = stochastic.simulate_stochastic(
+        fixture.case, fixture.model, horizon=4, samples=4, seed=7
+    )
+
+    def digest(payload: object) -> str:
+        canonical = json.dumps(
+            payload,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return sha256(canonical).hexdigest()
+
+    legacy_payload = {
+        "case": fixture.case.model_dump(mode="json", warnings=False),
+        "model": fixture.model.model_dump(mode="json", warnings=False),
+        "horizon_steps": 4,
+        "samples": 4,
+        "seed": 7,
+    }
+    rng_scheme = "numpy-seedsequence-spawn-uint64-pcg64-v1"
+    current_payload = {**legacy_payload, "rng_scheme": rng_scheme}
+    legacy_ensemble_id = f"ensemble-{digest(legacy_payload)}"
+    expected_ensemble_id = f"ensemble-{digest(current_payload)}"
+
+    assert ensemble.ensemble_id == expected_ensemble_id
+    assert ensemble.ensemble_id != legacy_ensemble_id
+    assert ensemble.rng_scheme == rng_scheme
+    assert f"rng_scheme:{rng_scheme}" in ensemble.provenance.reference
+
+    sample_seeds = (
+        3386250816931739734,
+        4042502035264064771,
+        17559002276220262541,
+        6823953754371609207,
+    )
+    for sample_index, (trajectory, sample_seed) in enumerate(
+        zip(ensemble.trajectories, sample_seeds, strict=True)
+    ):
+        legacy_member_id = "trajectory-" + digest(
+            {
+                **legacy_payload,
+                "sample_index": sample_index,
+                "sample_seed": sample_seed,
+            }
+        )
+        expected_member_id = "trajectory-" + digest(
+            {
+                **current_payload,
+                "sample_index": sample_index,
+                "sample_seed": sample_seed,
+            }
+        )
+        assert trajectory.trajectory_id == expected_member_id
+        assert trajectory.trajectory_id != legacy_member_id
+        assert trajectory.rng_scheme == rng_scheme
+        assert f"rng_scheme:{rng_scheme}" in trajectory.provenance.reference
 
 
 def test_summary_matches_hand_derived_paths_without_replacing_raw_samples() -> None:

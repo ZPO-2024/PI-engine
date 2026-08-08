@@ -118,6 +118,10 @@ class Trajectory(_ImmutablePredictionSchema):
         ge=0,
         exclude_if=lambda value: value is None,
     )
+    rng_scheme: NonEmptyString | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     initial_state: StateEstimate
     horizon: TrajectoryHorizon
     points: Annotated[tuple[TrajectoryPoint, ...], Field(min_length=1)]
@@ -362,6 +366,10 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
     case_id: NonEmptyString
     trajectories: Annotated[tuple[Trajectory, ...], Field(min_length=1)]
     seed: StrictInt | None = None
+    rng_scheme: NonEmptyString | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     summary: TrajectoryEnsembleSummary | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -426,6 +434,10 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
             if actual != expected:
                 raise ValueError(
                     "trajectory ensemble member identity must match ensemble"
+                )
+            if trajectory.rng_scheme != self.rng_scheme:
+                raise ValueError(
+                    "trajectory ensemble member RNG scheme must match ensemble"
                 )
             if trajectory.initial_state != expected_initial_state:
                 raise ValueError("trajectory ensemble members must share initial state")

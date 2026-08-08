@@ -35,6 +35,7 @@ _BERNOULLI_STEP_METADATA_KEYS = frozenset(
         "step_seconds",
     }
 )
+RNG_SCHEME = "numpy-seedsequence-spawn-uint64-pcg64-v1"
 
 
 class StochasticSimulationError(ValueError):
@@ -207,6 +208,7 @@ def simulate_stochastic(
         "horizon_steps": step_count,
         "samples": sample_count,
         "seed": root_seed,
+        "rng_scheme": RNG_SCHEME,
     }
     ensemble_id = f"ensemble-{_canonical_digest(identity_payload)}"
     child_sequences = np.random.SeedSequence(root_seed).spawn(sample_count)
@@ -215,7 +217,7 @@ def simulate_stochastic(
         sample_seed = int(
             child_sequence.generate_state(1, dtype=np.uint64)[0]
         )
-        rng = np.random.default_rng(sample_seed)
+        rng = np.random.Generator(np.random.PCG64(sample_seed))
         current_state = _current_state_values(validated_case)
         current_value = current_state.get(variable)
         if isinstance(current_value, tuple) or not isinstance(
@@ -259,6 +261,7 @@ def simulate_stochastic(
                 model_version=validated_model.version,
                 case_id=validated_case.case_id,
                 sample_seed=sample_seed,
+                rng_scheme=RNG_SCHEME,
                 initial_state=validated_case.state,
                 horizon=TrajectoryHorizon(
                     start_at=cutoff_utc,
@@ -272,7 +275,7 @@ def simulate_stochastic(
                     observed_at=cutoff_utc,
                     reference=(
                         f"run:{trajectory_id};sample_seed:{sample_seed};"
-                        f"spawn_index:{sample_index}"
+                        f"spawn_index:{sample_index};rng_scheme:{RNG_SCHEME}"
                     ),
                 ),
             )
@@ -285,11 +288,12 @@ def simulate_stochastic(
         case_id=validated_case.case_id,
         trajectories=tuple(trajectories),
         seed=root_seed,
+        rng_scheme=RNG_SCHEME,
         summary=summarize_trajectories(tuple(trajectories)),
         provenance=Provenance(
             source="PI-engine stochastic runner",
             observed_at=cutoff_utc,
-            reference=f"run:{ensemble_id}",
+            reference=f"run:{ensemble_id};rng_scheme:{RNG_SCHEME}",
         ),
     )
 
