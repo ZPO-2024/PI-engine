@@ -596,21 +596,29 @@ def test_residual_round_trip_preserves_trajectory_point_trace() -> None:
     assert Residual.model_validate_json(residual.model_dump_json()) == residual
 
 
-@pytest.mark.parametrize("field", ["trajectory_id", "prediction_time"])
-def test_residual_requires_prediction_trace_fields(field: str) -> None:
-    """Omitting either trace coordinate would leave the residual unanchored."""
+def test_residual_requires_prediction_time() -> None:
+    """Every residual needs the time coordinate of the evaluated prediction."""
     payload = residual_payload()
-    del payload[field]
+    del payload["prediction_time"]
 
     with pytest.raises(ValidationError) as exc_info:
         Residual.model_validate(payload)
 
-    assert exc_info.value.errors()[0]["loc"] == (field,)
+    assert exc_info.value.errors()[0]["loc"] == ("prediction_time",)
     assert exc_info.value.errors()[0]["type"] == "missing"
 
 
+def test_point_prediction_residual_requires_trajectory_id() -> None:
+    """A point prediction must retain the concrete trajectory that produced it."""
+    payload = residual_payload()
+    del payload["trajectory_id"]
+
+    with pytest.raises(ValidationError, match="trajectory_id"):
+        Residual.model_validate(payload)
+
+
 def test_residual_requires_timezone_aware_prediction_time() -> None:
-    """A naive point time cannot durably identify a trajectory coordinate."""
+    """A naive prediction time cannot durably identify a forecast coordinate."""
     with pytest.raises(ValidationError, match="prediction_time"):
         Residual.model_validate(
             residual_payload(prediction_time=datetime(2026, 8, 8, 18, 0))
@@ -631,13 +639,15 @@ def test_residual_requires_explicit_classification_instead_of_defaulting_to_nois
 
 def test_residual_preserves_distribution_reference_without_fabricated_point_value() -> None:
     """Distribution predictions must remain referentially intact when no point exists."""
-    residual = Residual.model_validate(
-        residual_payload(
-            predicted_value=None,
-            predicted_distribution_ref="ensemble:river-flow:quantiles:v1",
-        )
+    payload = residual_payload(
+        predicted_value=None,
+        predicted_distribution_ref="ensemble:river-flow:quantiles:v1",
     )
+    del payload["trajectory_id"]
 
+    residual = Residual.model_validate(payload)
+
+    assert residual.trajectory_id is None
     assert residual.predicted_value is None
     assert residual.predicted_distribution_ref == "ensemble:river-flow:quantiles:v1"
 

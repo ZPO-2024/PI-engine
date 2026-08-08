@@ -46,7 +46,7 @@ class Residual(_ImmutableResidualSchema):
     """A prediction/outcome difference retained as auditable data."""
 
     residual_id: NonEmptyString
-    trajectory_id: NonEmptyString
+    trajectory_id: NonEmptyString | None = None
     prediction_time: datetime
     model_id: NonEmptyString
     model_version: NonEmptyString
@@ -97,6 +97,8 @@ class Residual(_ImmutableResidualSchema):
     def validate_prediction_and_outcome_identity(self) -> "Residual":
         if self.predicted_value is None and self.predicted_distribution_ref is None:
             raise ValueError("a predicted value or distribution reference is required")
+        if self.predicted_value is not None and self.trajectory_id is None:
+            raise ValueError("trajectory_id is required for a predicted value")
 
         observed_identity = (
             self.observed_outcome.case_id,
