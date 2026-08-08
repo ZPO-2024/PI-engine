@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 import math
+import sys
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -10,14 +11,21 @@ from pydantic import ValidationError
 from pi_engine.evaluation.calibration import (
     CalibrationSummary,
     CalibrationError,
+    IntervalCalibrationSummary,
     summarize_calibration,
 )
-from pi_engine.evaluation.holdout import prepare_holdout, reveal_holdout
+from pi_engine.evaluation.holdout import (
+    prepare_holdout,
+    reveal_holdout,
+)
 from pi_engine.evaluation.scoring import (
+    ArtifactScore,
+    ContinuousPointScore,
     ForecastScoreReport,
     ScoringError,
     score_revealed_evaluation,
 )
+from pi_engine.schemas.trajectory import ScenarioWeight
 from pi_engine.simulation.runner import simulate_deterministic
 from pi_engine.simulation.stochastic import simulate_stochastic
 from pi_engine.synthetic.systems import (
@@ -73,14 +81,47 @@ def _revealed_ensemble():
     return prediction, reveal_holdout(prepared, prediction)
 
 
+def _revealed_two_trajectories():
+    fixture = linear_convergence()
+    prepared = prepare_holdout(fixture.case, fixture.outcomes)
+    first = simulate_deterministic(fixture.case, fixture.model, horizon=3)
+    second_points = tuple(
+        point.model_copy(update={"values": {"x": value}})
+        for point, value in zip(
+            first.points, (0.0, 2.0, 1.25), strict=True
+        )
+    )
+    second = first.model_copy(
+        update={
+            "trajectory_id": f"{first.trajectory_id}-alternate",
+            "points": second_points,
+        }
+    )
+    first_reveal = reveal_holdout(prepared, first)
+    second_reveal = reveal_holdout(prepared, second)
+    combined = first_reveal.model_copy(
+        update={
+            "prediction_references": (
+                first_reveal.prediction_references[0],
+                second_reveal.prediction_references[0],
+            )
+        }
+    )
+    return first, second, combined
+
+
 def test_known_continuous_errors_are_reported_per_model_and_variable() -> None:
     """A sign flip or opaque aggregation would hide inspectable error behavior."""
     prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
 
     report = score_revealed_evaluation(revealed, (prediction,))
 
+    assert report.source == revealed
     assert report.case_id == revealed.case_id
     assert report.case_sha256 == revealed.case_sha256
+    assert report.binary_probability_variables == ()
+    assert report.include_log_score is False
+    assert report.interval_levels == ()
     assert len(report.artifacts) == 1
     artifact = report.artifacts[0]
     assert (
@@ -165,20 +206,26 @@ def test_binary_brier_and_optional_log_scores_use_explicit_labels() -> None:
     assert [item.brier_score for item in artifact.probability_points] == pytest.approx(
         [0.0625, 0.25, 0.04]
     )
-    assert [item.log_score for item in artifact.probability_points] == pytest.approx(
+    assert [item.log_score.kind for item in artifact.probability_points] == [
+        "finite",
+        "finite",
+        "finite",
+    ]
+    assert [item.log_score.value for item in artifact.probability_points] == pytest.approx(
         [-math.log(0.75), -math.log(0.5), -math.log(0.8)]
     )
     assert len(artifact.probability_metrics) == 1
     metrics = artifact.probability_metrics[0]
     assert (metrics.variable, metrics.count) == ("x", 3)
     assert metrics.mean_brier_score == pytest.approx(0.1175)
-    assert metrics.mean_log_score == pytest.approx(
+    assert metrics.mean_log_score.kind == "finite"
+    assert metrics.mean_log_score.value == pytest.approx(
         (-math.log(0.75) - math.log(0.5) - math.log(0.8)) / 3.0
     )
 
 
-def test_log_score_rejects_zero_probability_for_observed_event_without_epsilon() -> None:
-    """Clipping an impossible event with an arbitrary epsilon invents evidence."""
+def test_log_score_tags_zero_probability_for_observed_event_without_epsilon() -> None:
+    """An impossible observed event is infinite loss, not invalid evidence."""
     prediction, revealed = _revealed_trajectory(
         (0.0, 0.0, 0.0), outcomes=(1.0, 0.0, 0.0)
     )
@@ -191,15 +238,20 @@ def test_log_score_rejects_zero_probability_for_observed_event_without_epsilon()
     assert brier_only.artifacts[0].probability_points[0].brier_score == 1.0
     assert brier_only.artifacts[0].probability_points[0].log_score is None
 
-    with pytest.raises(
-        ScoringError, match="zero probability.*observed label"
-    ):
-        score_revealed_evaluation(
-            revealed,
-            (prediction,),
-            binary_probability_variables=("x",),
-            include_log_score=True,
-        )
+    with_log = score_revealed_evaluation(
+        revealed,
+        (prediction,),
+        binary_probability_variables=("x",),
+        include_log_score=True,
+    )
+    artifact = with_log.artifacts[0]
+    assert artifact.probability_points[0].brier_score == 1.0
+    assert artifact.probability_points[0].log_score.kind == "positive_infinity"
+    assert artifact.probability_points[0].log_score.value is None
+    assert artifact.probability_metrics[0].mean_log_score.kind == (
+        "positive_infinity"
+    )
+    assert artifact.probability_metrics[0].mean_log_score.value is None
 
 
 def test_empirical_intervals_and_calibration_use_raw_ensemble_samples() -> None:
@@ -233,6 +285,8 @@ def test_empirical_intervals_and_calibration_use_raw_ensemble_samples() -> None:
     )
 
     calibration = summarize_calibration(report)
+    assert calibration.source == report
+    assert calibration.probability_bin_edges is None
     assert calibration.probability == ()
     assert len(calibration.intervals) == 2
     fifty, seventy_five = calibration.intervals
@@ -274,6 +328,8 @@ def test_probability_calibration_requires_explicit_bins_and_known_boundaries() -
         report, probability_bin_edges=(0.0, 0.5, 1.0)
     )
 
+    assert calibration.source == report
+    assert calibration.probability_bin_edges == (0.0, 0.5, 1.0)
     assert len(calibration.probability) == 1
     summary = calibration.probability[0]
     assert (
@@ -526,3 +582,306 @@ def test_calibration_revalidation_rejects_impossible_covered_count() -> None:
 
     with pytest.raises(ValidationError, match="covered_count"):
         CalibrationSummary.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [("case_id", "forged-case"), ("case_sha256", "0" * 64)],
+)
+def test_report_rejects_serialized_case_rebinding(
+    field_name: str, value: str
+) -> None:
+    """Detached case metadata must not be rebound to a different reveal."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    payload = report.model_dump()
+    payload[field_name] = value
+
+    with pytest.raises(ValidationError, match="source Case"):
+        ForecastScoreReport.model_validate(payload)
+
+
+def test_report_rejects_plausible_point_replacement_against_source() -> None:
+    """Self-consistent arithmetic cannot replace the revealed outcome record."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    payload = report.model_dump()
+    point = payload["artifacts"][0]["continuous_points"][0]
+    point["outcome_id"] = "forged-outcome"
+    point["forecast"] += 9.0
+    point["observed"] += 9.0
+
+    with pytest.raises(ValidationError, match="source outcome"):
+        ForecastScoreReport.model_validate(payload)
+
+
+def test_report_rejects_naive_point_timestamp() -> None:
+    """A wall-clock timestamp cannot stand in for an exact UTC instant."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    payload = report.model_dump()
+    payload["artifacts"][0]["continuous_points"][0]["event_time"] = datetime(
+        2026, 8, 8, 13, 0
+    )
+
+    with pytest.raises(ValidationError, match="timezone"):
+        ForecastScoreReport.model_validate(payload)
+
+
+def test_report_revalidates_nested_model_construct_point() -> None:
+    """Nested construct bypasses must fail at the report authority boundary."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    artifact = report.artifacts[0]
+    valid_point = artifact.continuous_points[0]
+    point_fields = {
+        name: getattr(valid_point, name)
+        for name in type(valid_point).model_fields
+    }
+    point_fields["outcome_id"] = "constructed-forgery"
+    forged_point = ContinuousPointScore.model_construct(**point_fields)
+    artifact_fields = {
+        name: getattr(artifact, name)
+        for name in type(artifact).model_fields
+    }
+    artifact_fields["continuous_points"] = (
+        forged_point,
+        *artifact.continuous_points[1:],
+    )
+    forged_artifact = ArtifactScore.model_construct(**artifact_fields)
+    report_fields = {
+        name: getattr(report, name) for name in type(report).model_fields
+    }
+    report_fields["artifacts"] = (forged_artifact,)
+    forged_report = ForecastScoreReport.model_construct(**report_fields)
+
+    with pytest.raises(ValidationError, match="source outcome"):
+        ForecastScoreReport.model_validate(forged_report)
+
+
+def test_artifacts_bind_by_identity_instead_of_caller_position() -> None:
+    """Reordering a complete artifact set must not change authorization."""
+    first, second, revealed = _revealed_two_trajectories()
+
+    report = score_revealed_evaluation(revealed, (second, first))
+
+    assert {item.artifact_id for item in report.artifacts} == {
+        first.trajectory_id,
+        second.trajectory_id,
+    }
+    assert tuple(item.reference for item in report.artifacts) == (
+        *revealed.prediction_references,
+    )
+
+
+def test_scoring_rejects_duplicate_prediction_references() -> None:
+    """One artifact authority cannot be counted twice as two predictions."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    reference = revealed.prediction_references[0]
+    duplicated = revealed.model_copy(
+        update={"prediction_references": (reference, reference)}
+    )
+
+    with pytest.raises(ScoringError, match="reference identities.*unique"):
+        score_revealed_evaluation(duplicated, (prediction, prediction))
+
+
+def test_scoring_rejects_duplicate_supplied_artifact_identity() -> None:
+    """Duplicating one supplied artifact cannot satisfy another reference."""
+    first, _, revealed = _revealed_two_trajectories()
+
+    with pytest.raises(ScoringError, match="supplied artifact identities.*unique"):
+        score_revealed_evaluation(revealed, (first, first))
+
+
+def test_report_rejects_duplicate_artifact_scores() -> None:
+    """Serialized score duplication must not inflate model evidence."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    payload = report.model_dump()
+    payload["artifacts"] = (
+        payload["artifacts"][0],
+        payload["artifacts"][0],
+    )
+
+    with pytest.raises(ValidationError, match="artifact identities.*unique"):
+        ForecastScoreReport.model_validate(payload)
+
+
+def test_calibration_rejects_forged_width_against_retained_report() -> None:
+    """Plausible standalone coverage cannot authorize a fabricated width."""
+    prediction, revealed = _revealed_ensemble()
+    report = score_revealed_evaluation(
+        revealed, (prediction,), interval_levels=(0.5,)
+    )
+    calibration = summarize_calibration(report)
+    payload = calibration.model_dump()
+    payload["intervals"][0]["mean_interval_width"] = 999.0
+
+    with pytest.raises(ValidationError, match="recompute from source"):
+        CalibrationSummary.model_validate(payload)
+
+
+def test_calibration_revalidates_nested_model_construct_summary() -> None:
+    """Constructed nested aggregates must be recomputed from scored records."""
+    prediction, revealed = _revealed_ensemble()
+    report = score_revealed_evaluation(
+        revealed, (prediction,), interval_levels=(0.5,)
+    )
+    calibration = summarize_calibration(report)
+    interval = calibration.intervals[0]
+    interval_fields = {
+        name: getattr(interval, name)
+        for name in type(interval).model_fields
+    }
+    interval_fields["mean_interval_width"] = 999.0
+    forged_interval = IntervalCalibrationSummary.model_construct(
+        **interval_fields
+    )
+    calibration_fields = {
+        name: getattr(calibration, name)
+        for name in type(calibration).model_fields
+    }
+    calibration_fields["intervals"] = (forged_interval,)
+    forged = CalibrationSummary.model_construct(**calibration_fields)
+
+    with pytest.raises(ValidationError, match="recompute from source"):
+        CalibrationSummary.model_validate(forged)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("overlap", "contiguous"),
+        ("early-upper-inclusive", "only the final"),
+        ("mean-outside-bin", "mean.*within its bin"),
+    ],
+)
+def test_probability_calibration_rejects_invalid_bin_topology(
+    mutation: str, message: str
+) -> None:
+    """Bins must be a complete, non-overlapping partition with valid means."""
+    prediction, revealed = _revealed_trajectory(
+        (0.25, 0.5, 0.8), outcomes=(0.0, 1.0, 1.0)
+    )
+    report = score_revealed_evaluation(
+        revealed,
+        (prediction,),
+        binary_probability_variables=("x",),
+    )
+    calibration = summarize_calibration(
+        report, probability_bin_edges=(0.0, 0.5, 1.0)
+    )
+    payload = calibration.model_dump()
+    bins = payload["probability"][0]["bins"]
+    if mutation == "overlap":
+        bins[0]["upper"] = 0.6
+    elif mutation == "early-upper-inclusive":
+        bins[0]["upper_inclusive"] = True
+    else:
+        bins[0]["mean_predicted_probability"] = 0.75
+        bins[0]["calibration_error"] = -0.75
+
+    with pytest.raises(ValidationError, match=message):
+        CalibrationSummary.model_validate(payload)
+
+
+def test_calibration_rejects_duplicate_probability_summary_key() -> None:
+    """One model-variable calibration summary cannot be counted twice."""
+    prediction, revealed = _revealed_trajectory(
+        (0.25, 0.5, 0.8), outcomes=(0.0, 1.0, 1.0)
+    )
+    report = score_revealed_evaluation(
+        revealed,
+        (prediction,),
+        binary_probability_variables=("x",),
+    )
+    calibration = summarize_calibration(
+        report, probability_bin_edges=(0.0, 0.5, 1.0)
+    )
+    payload = calibration.model_dump()
+    payload["probability"] = (
+        payload["probability"][0],
+        payload["probability"][0],
+    )
+
+    with pytest.raises(ValidationError, match="summary keys.*unique"):
+        CalibrationSummary.model_validate(payload)
+
+
+def test_max_float_relative_weights_normalize_without_overflow() -> None:
+    """Equivalent large relative weights must not overflow before scaling."""
+    prediction, revealed = _revealed_ensemble()
+    weight = ScenarioWeight(
+        kind="relative_weight",
+        value=sys.float_info.max,
+        justification="equal maximum finite evidence weights",
+    )
+    trajectories = tuple(
+        item.model_copy(update={"scenario_weight": weight})
+        for item in prediction.trajectories
+    )
+    weighted = prediction.model_copy(update={"trajectories": trajectories})
+    fixture = stochastic_branching(seed=7)
+    prepared = prepare_holdout(fixture.case, fixture.outcomes)
+    weighted_reveal = reveal_holdout(prepared, weighted)
+
+    report = score_revealed_evaluation(weighted_reveal, (weighted,))
+
+    artifact = report.artifacts[0]
+    assert artifact.point_estimate_method == (
+        "normalized_relative_weight_raw_samples"
+    )
+    assert [item.forecast for item in artifact.continuous_points] == [
+        0.5,
+        0.5,
+        0.5,
+        0.5,
+    ]
+
+
+def test_scaled_continuous_mean_keeps_three_large_squared_errors_finite() -> None:
+    """Summing finite squares before division must not overflow their mean."""
+    prediction, revealed = _revealed_trajectory(
+        (1e154, 1e154, 1e154), outcomes=(0.0, 0.0, 0.0)
+    )
+
+    report = score_revealed_evaluation(revealed, (prediction,))
+
+    metrics = report.artifacts[0].continuous_metrics[0]
+    assert metrics.mean_error == pytest.approx(1e154)
+    assert metrics.mean_absolute_error == pytest.approx(1e154)
+    assert metrics.mean_squared_error == pytest.approx(1e308)
+    assert metrics.root_mean_squared_error == pytest.approx(1e154)
+
+
+def test_scaled_interval_width_mean_avoids_sum_overflow() -> None:
+    """Several finite wide intervals can still have a finite mean width."""
+    prediction, revealed = _revealed_ensemble()
+    report = score_revealed_evaluation(
+        revealed, (prediction,), interval_levels=(0.5,)
+    )
+    payload = report.model_dump()
+    for interval in payload["artifacts"][0]["intervals"]:
+        interval.update(
+            {
+                "lower": -5e307,
+                "upper": 5e307,
+                "covered": True,
+            }
+        )
+    wide_report = ForecastScoreReport.model_validate(payload)
+
+    calibration = summarize_calibration(wide_report)
+
+    assert calibration.intervals[0].mean_interval_width == pytest.approx(1e308)
+
+
+def test_huge_integer_outcome_is_wrapped_as_scoring_error() -> None:
+    """Schema-valid integers outside float range must not leak OverflowError."""
+    prediction, revealed = _revealed_trajectory(
+        (0.0, 0.5, 0.25), outcomes=(10**400, 0.5, 0.25)
+    )
+
+    with pytest.raises(ScoringError, match="outcome.*representable"):
+        score_revealed_evaluation(revealed, (prediction,))

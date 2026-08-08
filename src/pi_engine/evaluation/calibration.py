@@ -142,14 +142,55 @@ class ProbabilityCalibrationSummary(_ImmutableCalibrationSchema):
     def validate_count(self) -> ProbabilityCalibrationSummary:
         if sum(item.count for item in self.bins) != self.count:
             raise ValueError("probability calibration bin counts must match count")
+        if self.bins[0].lower_inclusive != 0.0 or self.bins[-1].upper != 1.0:
+            raise ValueError("probability bins must span exactly [0, 1]")
+        for index, item in enumerate(self.bins):
+            final = index == len(self.bins) - 1
+            if item.upper_inclusive != final:
+                raise ValueError(
+                    "only the final probability bin may be upper-inclusive"
+                )
+            if index and item.lower_inclusive != self.bins[index - 1].upper:
+                raise ValueError(
+                    "probability bins must be complete and contiguous"
+                )
+            mean = item.mean_predicted_probability
+            if mean is not None:
+                in_bin = item.lower_inclusive <= mean < item.upper
+                if final:
+                    in_bin = item.lower_inclusive <= mean <= item.upper
+                if not in_bin:
+                    raise ValueError(
+                        "probability bin mean must fall within its bin"
+                    )
         return self
 
 
 class CalibrationSummary(_ImmutableCalibrationSchema):
-    """Separate interval and probability calibration; no model aggregation."""
+    """Source-bound calibration with no cross-model aggregation.
 
+    Self-validation recomputes every aggregate from the retained score report.
+    An external signature remains necessary for adversarial authenticity.
+    """
+
+    source: ForecastScoreReport
+    probability_bin_edges: tuple[FiniteFloat, ...] | None
     intervals: tuple[IntervalCalibrationSummary, ...]
     probability: tuple[ProbabilityCalibrationSummary, ...]
+
+    @field_validator("source", mode="before")
+    @classmethod
+    def revalidate_source(cls, value: object) -> object:
+        if isinstance(value, ForecastScoreReport):
+            return ForecastScoreReport.model_validate(
+                value.model_dump(warnings=False)
+            )
+        return value
+
+    @field_validator("probability_bin_edges", mode="before")
+    @classmethod
+    def validate_probability_bin_edges(cls, value: object) -> object:
+        return _bin_edges(value)
 
     @field_validator("intervals", "probability", mode="before")
     @classmethod
@@ -167,6 +208,50 @@ class CalibrationSummary(_ImmutableCalibrationSchema):
             else item
             for item in value
         )
+
+    @model_validator(mode="after")
+    def validate_source_recomputation(self) -> CalibrationSummary:
+        interval_keys = tuple(
+            (
+                item.artifact_type,
+                item.artifact_id,
+                item.artifact_sha256,
+                item.model_id,
+                item.model_version,
+                item.variable,
+                item.nominal_coverage,
+                item.interval_method,
+            )
+            for item in self.intervals
+        )
+        probability_keys = tuple(
+            (
+                item.artifact_type,
+                item.artifact_id,
+                item.artifact_sha256,
+                item.model_id,
+                item.model_version,
+                item.variable,
+            )
+            for item in self.probability
+        )
+        if (
+            len(set(interval_keys)) != len(interval_keys)
+            or len(set(probability_keys)) != len(probability_keys)
+        ):
+            raise ValueError("calibration summary keys must be unique")
+        expected_intervals = _interval_calibration(self.source.artifacts)
+        expected_probability = _probability_calibration(
+            self.source.artifacts, self.probability_bin_edges
+        )
+        if (
+            self.intervals != expected_intervals
+            or self.probability != expected_probability
+        ):
+            raise ValueError(
+                "calibration summaries must exactly recompute from source"
+            )
+        return self
 
 
 def _revalidate_report(value: object) -> ForecastScoreReport:
@@ -206,6 +291,24 @@ def _bin_edges(value: object | None) -> tuple[float, ...] | None:
     return edges
 
 
+def _stable_mean(values: Sequence[float], message: str) -> float:
+    if not values:
+        raise CalibrationError("mean requires at least one value")
+    scale = max(abs(value) for value in values)
+    if scale == 0.0:
+        return 0.0
+    try:
+        normalized_mean = math.fsum(value / scale for value in values) / len(
+            values
+        )
+        result = scale * normalized_mean
+    except (OverflowError, ZeroDivisionError) as exc:
+        raise CalibrationError(message) from exc
+    if not math.isfinite(result):
+        raise CalibrationError(message)
+    return result
+
+
 def _interval_calibration(
     artifacts: tuple[ArtifactScore, ...],
 ) -> tuple[IntervalCalibrationSummary, ...]:
@@ -243,12 +346,10 @@ def _interval_calibration(
         covered_count = sum(1 for item in items if item.covered)
         observed_coverage = covered_count / count
         calibration_error = observed_coverage - nominal_coverage
-        try:
-            mean_width = math.fsum(
-                item.upper - item.lower for item in items
-            ) / count
-        except OverflowError as exc:
-            raise CalibrationError("interval width is not finite") from exc
+        widths = tuple(item.upper - item.lower for item in items)
+        if any(not math.isfinite(item) for item in widths):
+            raise CalibrationError("interval width is not finite")
+        mean_width = _stable_mean(widths, "interval width is not finite")
         if not all(
             math.isfinite(value)
             for value in (
@@ -311,10 +412,14 @@ def _probability_bins(
             )
             continue
         count = len(members)
-        mean_probability = (
-            math.fsum(item.predicted_probability for item in members) / count
+        mean_probability = _stable_mean(
+            tuple(item.predicted_probability for item in members),
+            "probability-bin mean is not finite",
         )
-        observed_frequency = math.fsum(item.label for item in members) / count
+        observed_frequency = _stable_mean(
+            tuple(float(item.label) for item in members),
+            "probability-bin frequency is not finite",
+        )
         calibration_error = observed_frequency - mean_probability
         bins.append(
             ProbabilityCalibrationBin(
@@ -365,6 +470,8 @@ def summarize_calibration(
     validated = _revalidate_report(report)
     edges = _bin_edges(probability_bin_edges)
     return CalibrationSummary(
+        source=validated,
+        probability_bin_edges=edges,
         intervals=_interval_calibration(validated.artifacts),
         probability=_probability_calibration(validated.artifacts, edges),
     )
