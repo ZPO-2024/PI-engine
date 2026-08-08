@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -130,6 +131,45 @@ def test_case_rejects_observation_available_after_cutoff_despite_earlier_event()
 
     with pytest.raises(ValidationError, match="available_at"):
         make_case(observations=(late_observation,))
+
+
+def test_case_accepts_observation_absolutely_before_inverse_fold_cutoff() -> None:
+    """A wall-later first-fold publication can be earlier than a second-fold cutoff."""
+    eastern = ZoneInfo("America/New_York")
+    cutoff = datetime(2026, 11, 1, 1, 15, tzinfo=eastern, fold=1)
+    earlier = datetime(2026, 11, 1, 1, 30, tzinfo=eastern, fold=0)
+    observation = make_observation(
+        event_time=datetime(2026, 11, 1, 1, 0, tzinfo=eastern, fold=0),
+        available_at=earlier,
+    )
+
+    case = make_case(
+        prediction_cutoff=cutoff,
+        observations=(observation,),
+        state=make_case().state.model_copy(update={"at": cutoff}),
+    )
+
+    assert case.observations[0].available_at.astimezone(UTC) < (
+        case.prediction_cutoff.astimezone(UTC)
+    )
+
+
+def test_case_rejects_observation_absolutely_after_first_fold_cutoff() -> None:
+    """A wall-earlier second-fold publication is still post-cutoff leakage."""
+    eastern = ZoneInfo("America/New_York")
+    cutoff = datetime(2026, 11, 1, 1, 30, tzinfo=eastern, fold=0)
+    later = datetime(2026, 11, 1, 1, 15, tzinfo=eastern, fold=1)
+    observation = make_observation(
+        event_time=datetime(2026, 11, 1, 1, 0, tzinfo=eastern, fold=0),
+        available_at=later,
+    )
+
+    with pytest.raises(ValidationError, match="available_at"):
+        make_case(
+            prediction_cutoff=cutoff,
+            observations=(observation,),
+            state=make_case().state.model_copy(update={"at": cutoff}),
+        )
 
 
 def test_case_rejects_observation_from_a_different_case() -> None:
@@ -294,6 +334,37 @@ def test_case_rejects_state_estimated_after_prediction_cutoff() -> None:
                 uncertainty={"flow": 0.4},
                 boundary={},
             )
+        )
+
+
+def test_case_accepts_state_absolutely_before_inverse_fold_cutoff() -> None:
+    """A wall-later first-fold state can precede a second-fold cutoff."""
+    eastern = ZoneInfo("America/New_York")
+    cutoff = datetime(2026, 11, 1, 1, 15, tzinfo=eastern, fold=1)
+    earlier = datetime(2026, 11, 1, 1, 30, tzinfo=eastern, fold=0)
+    state = make_case().state.model_copy(update={"at": earlier})
+
+    case = make_case(
+        prediction_cutoff=cutoff,
+        observations=(),
+        state=state,
+    )
+
+    assert case.state.at.astimezone(UTC) < case.prediction_cutoff.astimezone(UTC)
+
+
+def test_case_rejects_state_absolutely_after_first_fold_cutoff() -> None:
+    """A wall-earlier second-fold state remains future leakage."""
+    eastern = ZoneInfo("America/New_York")
+    cutoff = datetime(2026, 11, 1, 1, 30, tzinfo=eastern, fold=0)
+    later = datetime(2026, 11, 1, 1, 15, tzinfo=eastern, fold=1)
+    state = make_case().state.model_copy(update={"at": later})
+
+    with pytest.raises(ValidationError, match="state time"):
+        make_case(
+            prediction_cutoff=cutoff,
+            observations=(),
+            state=state,
         )
 
 

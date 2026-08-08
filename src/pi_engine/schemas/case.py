@@ -10,6 +10,26 @@ from pi_engine.schemas.observation import Observation
 from pi_engine.schemas.state import StateEstimate
 
 
+def _utc_instant_key(value: datetime) -> int:
+    """Return absolute microseconds without constructing an out-of-range UTC date."""
+    offset = value.utcoffset()
+    if offset is None:
+        raise ValueError("datetime must include a timezone")
+    local_microseconds = (
+        (
+            ((value.toordinal() * 24 + value.hour) * 60 + value.minute) * 60
+            + value.second
+        )
+        * 1_000_000
+        + value.microsecond
+    )
+    offset_microseconds = (
+        (offset.days * 86_400 + offset.seconds) * 1_000_000
+        + offset.microseconds
+    )
+    return local_microseconds - offset_microseconds
+
+
 class VariableDefinition(BaseModel):
     """A canonical variable identity and unit within a case."""
 
@@ -45,6 +65,7 @@ class Case(BaseModel):
 
     @model_validator(mode="after")
     def validate_canonical_references_and_cutoff(self) -> "Case":
+        cutoff_instant = _utc_instant_key(self.prediction_cutoff)
         variable_units: dict[str, str] = {}
         for definition in self.canonical_variables:
             if definition.name in variable_units:
@@ -54,7 +75,7 @@ class Case(BaseModel):
         for observation in self.observations:
             if observation.case_id != self.case_id:
                 raise ValueError("observation case_id must match the case")
-            if observation.available_at > self.prediction_cutoff:
+            if _utc_instant_key(observation.available_at) > cutoff_instant:
                 raise ValueError("observation available_at must not exceed prediction_cutoff")
             expected_unit = variable_units.get(observation.variable)
             if expected_unit is None:
@@ -66,7 +87,7 @@ class Case(BaseModel):
                     f"observation unit must be {expected_unit!r} for {observation.variable!r}"
                 )
 
-        if self.state.at > self.prediction_cutoff:
+        if _utc_instant_key(self.state.at) > cutoff_instant:
             raise ValueError("state time must not exceed prediction_cutoff")
 
         known_variables = set(variable_units)

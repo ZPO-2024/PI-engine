@@ -290,6 +290,39 @@ def test_prepare_uses_absolute_case_availability_and_state_across_fold() -> None
         prepare_holdout(late_state_case, (outcome,))
 
 
+def test_prepare_accepts_inverse_fold_case_that_is_absolutely_cutoff_safe() -> None:
+    """Case revalidation must retain valid earlier-fold evidence and state."""
+    from pi_engine.evaluation.holdout import prepare_holdout
+
+    fixture = linear_convergence()
+    eastern = ZoneInfo("America/New_York")
+    cutoff = datetime(2026, 11, 1, 1, 15, tzinfo=eastern, fold=1)
+    earlier = datetime(2026, 11, 1, 1, 30, tzinfo=eastern, fold=0)
+    observation = fixture.case.observations[0].model_copy(
+        update={
+            "event_time": datetime(
+                2026, 11, 1, 1, 0, tzinfo=eastern, fold=0
+            ),
+            "available_at": earlier,
+        }
+    )
+    case = fixture.case.model_copy(
+        update={
+            "prediction_cutoff": cutoff,
+            "observations": (observation,),
+            "state": fixture.case.state.model_copy(update={"at": earlier}),
+        }
+    )
+    future = cutoff.astimezone(UTC) + timedelta(hours=1)
+    outcome = fixture.outcomes[0].model_copy(
+        update={"event_time": future, "available_at": future}
+    )
+
+    prepared = prepare_holdout(case, (outcome,))
+
+    assert prepared.case.prediction_cutoff == cutoff
+
+
 def test_reveal_returns_coherent_verifiable_round_trip() -> None:
     """Reveal must disclose enough nonce/case identity to verify every commitment."""
     from pi_engine.evaluation.holdout import (
