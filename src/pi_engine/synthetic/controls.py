@@ -24,10 +24,12 @@ _IDENTITY_VECTOR_SHA256 = (
 def random_graph_control(seed: int = 0) -> SyntheticSystem:
     """Return random directed topology with independent Gaussian vector truth.
 
-    ``independent_gaussian`` ignores graph edges and draws each vector component
-    independently from ``Normal(mean, standard_deviation)`` using the run seed.
+    ``SeedSequence(seed).spawn(2)`` assigns child 0 to topology and child 1 to
+    outcomes. ``independent_gaussian`` ignores graph edges and draws each vector
+    component independently from ``Normal(mean, standard_deviation)``.
     """
-    graph_rng = np.random.default_rng(seed)
+    graph_seed, outcome_seed = np.random.SeedSequence(seed).spawn(2)
+    graph_rng = np.random.default_rng(graph_seed)
     edges: list[GraphEdge] = []
     for source in range(5):
         for target in range(5):
@@ -43,7 +45,7 @@ def random_graph_control(seed: int = 0) -> SyntheticSystem:
                         effective_proximity=float(graph_rng.uniform(0.1, 5.0)),
                     )
                 )
-    outcome_rng = np.random.default_rng(seed)
+    outcome_rng = np.random.default_rng(outcome_seed)
     outcome = tuple(float(value) for value in outcome_rng.normal(0.0, 1.0, 5))
     zero_vector = (0.0, 0.0, 0.0, 0.0, 0.0)
     return _build_fixture(
@@ -59,21 +61,33 @@ def random_graph_control(seed: int = 0) -> SyntheticSystem:
                 for index in range(5)
             ),
             edges=tuple(edges),
-            topology_metadata={"randomized": True},
+            topology_metadata={
+                "randomized": True,
+                "rng_spawn_count": 2,
+                "rng_spawn_index": 0,
+            },
         ),
         executor_ref="independent_gaussian",
         code_sha256=_INDEPENDENT_GAUSSIAN_SHA256,
-        equations=("next[i] ~ Normal(mean, standard_deviation) independently",),
-        rules=("draw one value per vector component in index order",),
+        equations=(
+            "next[i] ~ Normal(mean, standard_deviation) independently",
+        ),
+        rules=(
+            "use SeedSequence(seed).spawn(rng_spawn_count)[rng_spawn_index]",
+            "draw one value per vector component in index order",
+        ),
         transition_metadata={
             "state_variable": "values",
             "mean": 0.0,
             "standard_deviation": 1.0,
+            "rng_spawn_count": 2,
+            "rng_spawn_index": 1,
             "step_seconds": 3600,
         },
         classification="stochastic",
         outcomes=((1, "values", outcome),),
         model_family="independent_noise_control",
+        process_disturbance=("independent Gaussian component draws",),
         is_control=True,
     )
 
@@ -123,6 +137,7 @@ def shuffled_time_series_control(seed: int = 0) -> SyntheticSystem:
         classification="stochastic",
         outcomes=((1, "signal", shuffled[-1]),),
         model_family="permutation_control",
+        process_disturbance=("seeded permutation without replacement",),
         is_control=True,
     )
 

@@ -303,6 +303,7 @@ def _build_fixture(
     relationships_used: tuple[str, ...] = (),
     phase_dependencies: tuple[str, ...] = (),
     effective_proximity_dependencies: tuple[str, ...] = (),
+    process_disturbance: tuple[str, ...] = (),
     is_control: bool = False,
 ) -> SyntheticSystem:
     """Assemble schemas; transition equations remain exclusively in ExplicitModel."""
@@ -391,11 +392,7 @@ def _build_fixture(
             },
             "uncertainty": {
                 "parameter_uncertainty": (),
-                "process_disturbance": (
-                    ("seeded Bernoulli branch",)
-                    if classification == "stochastic"
-                    else ()
-                ),
+                "process_disturbance": process_disturbance,
                 "model_discrepancy": (),
                 "structured_unknowns": (),
             },
@@ -568,6 +565,7 @@ def stochastic_branching(seed: int = 0) -> SyntheticSystem:
         classification="stochastic",
         outcomes=tuple(outcome_values),
         model_family="seeded_random_walk",
+        process_disturbance=("seeded Bernoulli branch",),
     )
 
 

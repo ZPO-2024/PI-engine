@@ -245,30 +245,77 @@ def test_system_catalog_names_every_required_positive_factory() -> None:
 
 
 def test_random_graph_control_has_literal_seeded_topology_and_vector_outcome() -> None:
-    """A fixed or scalar graph would not test accidental structure recovery."""
+    """Shared graph/outcome RNG state would confound the negative control."""
     controls = import_module("pi_engine.synthetic.controls")
     fixture = controls.random_graph_control(seed=7)
     edges = fixture.case.graph.edges
 
     assert [(edge.source, edge.target) for edge in edges] == [
+        ("node-0", "node-2"),
         ("node-0", "node-4"),
         ("node-1", "node-0"),
-        ("node-1", "node-4"),
-        ("node-3", "node-2"),
+        ("node-3", "node-1"),
         ("node-3", "node-4"),
     ]
-    assert edges[0].strength == pytest.approx(-0.39966743017754913)
-    assert edges[0].effective_proximity == pytest.approx(4.380411882441683)
+    assert edges[0].strength == pytest.approx(0.1827022348597933)
+    assert edges[0].effective_proximity == pytest.approx(4.357243202416154)
     assert fixture.case.state.observed["values"] == (0.0, 0.0, 0.0, 0.0, 0.0)
     assert fixture.outcomes[0].value == pytest.approx(
         (
-            0.0012301533574825742,
-            0.2987455375084699,
-            -0.2741378553622176,
-            -0.8905918387572742,
-            -0.45467078517172255,
+            1.4019101206317888,
+            0.8534203299688002,
+            3.05630239701777,
+            -0.057023513331478363,
+            1.2870073210024566,
         )
     )
+    assert fixture.case.graph.topology_metadata == {
+        "randomized": True,
+        "rng_spawn_count": 2,
+        "rng_spawn_index": 0,
+    }
+    assert fixture.model.dynamics.transition_metadata == {
+        "state_variable": "values",
+        "mean": 0.0,
+        "standard_deviation": 1.0,
+        "rng_spawn_count": 2,
+        "rng_spawn_index": 1,
+        "step_seconds": 3600,
+    }
+
+
+@pytest.mark.parametrize(
+    ("module_name", "factory_name", "expected"),
+    [
+        ("systems", "linear_convergence", ()),
+        ("systems", "oscillation", ()),
+        ("systems", "deterministic_divergence", ()),
+        ("systems", "stochastic_branching", ("seeded Bernoulli branch",)),
+        ("systems", "coupled_oscillators", ()),
+        ("systems", "feedback_instability", ()),
+        ("systems", "hierarchical_nested_dynamics", ()),
+        (
+            "controls",
+            "random_graph_control",
+            ("independent Gaussian component draws",),
+        ),
+        (
+            "controls",
+            "shuffled_time_series_control",
+            ("seeded permutation without replacement",),
+        ),
+        ("controls", "irrelevant_proximity_control", ()),
+        ("controls", "no_paired_structure_control", ()),
+    ],
+)
+def test_fixture_process_disturbance_matches_declared_transition(
+    module_name: str, factory_name: str, expected: tuple[str, ...]
+) -> None:
+    """Classification-only disturbance labels would misstate model assumptions."""
+    module = import_module(f"pi_engine.synthetic.{module_name}")
+    fixture = getattr(module, factory_name)(seed=7)
+
+    assert fixture.model.uncertainty.process_disturbance == expected
 
 
 def test_shuffled_series_control_uses_literal_seeded_order() -> None:
