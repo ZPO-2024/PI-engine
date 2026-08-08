@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from importlib import import_module
 from itertools import pairwise
 from zoneinfo import ZoneInfo
@@ -55,9 +55,9 @@ def test_summary_matches_hand_derived_paths_without_replacing_raw_samples() -> N
         [point.values["x"] for point in trajectory.points]
         for trajectory in ensemble.trajectories
     ] == [
-        [-1.0, 0.0, 1.0],
+        [1.0, 0.0, -1.0],
         [1.0, 2.0, 3.0],
-        [-1.0, 0.0, 1.0],
+        [-1.0, -2.0, -1.0],
     ]
     assert ensemble.summary is not None
     assert [point.at for point in ensemble.summary.points] == [
@@ -68,15 +68,15 @@ def test_summary_matches_hand_derived_paths_without_replacing_raw_samples() -> N
     statistics = [point.statistics["x"] for point in ensemble.summary.points]
     assert [item.count for item in statistics] == [3, 3, 3]
     assert [item.mean for item in statistics] == pytest.approx(
-        [-1.0 / 3.0, 2.0 / 3.0, 5.0 / 3.0]
+        [1.0 / 3.0, 0.0, 1.0 / 3.0]
     )
     assert [item.population_variance for item in statistics] == pytest.approx(
-        [8.0 / 9.0] * 3
+        [8.0 / 9.0, 8.0 / 3.0, 32.0 / 9.0]
     )
     assert [item.population_std for item in statistics] == pytest.approx(
-        [0.9428090415820634] * 3
+        [0.9428090415820634, 1.632993161855452, 1.8856180831641267]
     )
-    assert [item.minimum for item in statistics] == [-1.0, 0.0, 1.0]
+    assert [item.minimum for item in statistics] == [-1.0, -2.0, -1.0]
     assert [item.maximum for item in statistics] == [1.0, 2.0, 3.0]
 
 
@@ -145,6 +145,26 @@ def test_members_retain_spawned_seed_identity_and_model_provenance() -> None:
     assert TrajectoryEnsemble.model_validate_json(
         ensemble.model_dump_json()
     ) == ensemble
+
+
+def test_retained_sample_seed_replays_exact_member_stream() -> None:
+    """A displayed seed that initializes another stream is not replay identity."""
+    fixture = stochastic_branching(seed=7)
+    stochastic = import_module("pi_engine.simulation.stochastic")
+    ensemble = stochastic.simulate_stochastic(
+        fixture.case, fixture.model, horizon=4, samples=4, seed=7
+    )
+
+    for trajectory in ensemble.trajectories:
+        rng = np.random.default_rng(trajectory.sample_seed)
+        current = 0.0
+        replayed_path: list[float] = []
+        for _ in range(4):
+            current += 1.0 if rng.random() < 0.6 else -1.0
+            replayed_path.append(current)
+        assert replayed_path == [
+            point.values["x"] for point in trajectory.points
+        ]
 
 
 def test_different_root_seed_changes_streams_and_identities() -> None:
@@ -236,6 +256,43 @@ def test_fixed_steps_advance_in_absolute_utc_time_across_dst() -> None:
         for earlier, later in pairwise(timeline)
     ] == [3600.0, 3600.0, 3600.0]
     assert all(value.tzinfo is UTC for value in timeline)
+
+
+@pytest.mark.parametrize(
+    "cutoff",
+    [
+        datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=1))),
+        datetime(
+            9999,
+            12,
+            31,
+            23,
+            59,
+            tzinfo=timezone(-timedelta(hours=1)),
+        ),
+    ],
+    ids=("lower-year-boundary", "upper-year-boundary"),
+)
+def test_runner_wraps_utc_normalization_overflow(cutoff: datetime) -> None:
+    """Out-of-range UTC conversion must not leak raw datetime overflow."""
+    fixture = stochastic_branching(seed=7)
+    state = fixture.case.state.model_copy(update={"at": cutoff})
+    case = fixture.case.model_copy(
+        update={
+            "prediction_cutoff": cutoff,
+            "observations": (),
+            "state": state,
+        }
+    )
+    stochastic = import_module("pi_engine.simulation.stochastic")
+
+    with pytest.raises(
+        stochastic.StochasticSimulationError,
+        match="UTC normalization.*datetime range",
+    ):
+        stochastic.simulate_stochastic(
+            case, fixture.model, horizon=1, samples=1, seed=7
+        )
 
 
 @pytest.mark.parametrize("field_name", ["horizon", "samples"])
@@ -433,6 +490,22 @@ def test_ensemble_rejects_duplicate_sample_identity() -> None:
     ]
 
     with pytest.raises(ValidationError, match="identities must be distinct"):
+        TrajectoryEnsemble.model_validate(payload)
+
+
+def test_ensemble_rejects_member_constraint_mismatch() -> None:
+    """Differently constrained paths cannot share one conditioning ensemble."""
+    fixture = stochastic_branching(seed=7)
+    stochastic = import_module("pi_engine.simulation.stochastic")
+    ensemble = stochastic.simulate_stochastic(
+        fixture.case, fixture.model, horizon=1, samples=2, seed=7
+    )
+    payload = ensemble.model_dump()
+    payload["trajectories"][1]["constraints_encountered"] = (
+        "different sample constraint",
+    )
+
+    with pytest.raises(ValidationError, match="constraints"):
         TrajectoryEnsemble.model_validate(payload)
 
 

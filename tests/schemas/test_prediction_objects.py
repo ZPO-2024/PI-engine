@@ -17,6 +17,7 @@ from pi_engine.schemas.trajectory import (
     TrajectoryEnsemble,
     TrajectoryHorizon,
     TrajectoryPoint,
+    summarize_trajectories,
 )
 
 
@@ -244,6 +245,49 @@ def test_trajectory_ensemble_round_trip_retains_raw_samples_and_seed() -> None:
     ]
     assert ensemble.seed == 9173
     assert TrajectoryEnsemble.model_validate_json(ensemble.model_dump_json()) == ensemble
+
+
+def test_scalar_summary_handles_equal_large_finite_values() -> None:
+    """A finite equal population must not overflow while computing its mean."""
+    trajectories = tuple(
+        Trajectory.model_validate(
+            trajectory_payload(
+                trajectory_id=f"trajectory-large-{index}",
+                points=(TrajectoryPoint(at=END, values={"flow": 1e308}),),
+                scenario_weight=None,
+            )
+        )
+        for index in range(2)
+    )
+
+    summary = summarize_trajectories(trajectories)
+
+    statistics = summary.points[0].statistics["flow"]
+    assert statistics.count == 2
+    assert statistics.mean == 1e308
+    assert statistics.population_variance == 0.0
+    assert statistics.population_std == 0.0
+    assert statistics.minimum == 1e308
+    assert statistics.maximum == 1e308
+
+
+def test_scalar_summary_rejects_unrepresentable_extreme_variance_deliberately() -> None:
+    """An extreme finite spread must raise a domain error, not raw overflow."""
+    trajectories = tuple(
+        Trajectory.model_validate(
+            trajectory_payload(
+                trajectory_id=f"trajectory-extreme-{index}",
+                points=(TrajectoryPoint(at=END, values={"flow": value}),),
+                scenario_weight=None,
+            )
+        )
+        for index, value in enumerate((1e308, -1e308))
+    )
+
+    with pytest.raises(
+        ValueError, match="population variance.*not representable"
+    ):
+        summarize_trajectories(trajectories)
 
 
 def test_trajectory_ensemble_rejects_mixed_model_or_case_identity() -> None:

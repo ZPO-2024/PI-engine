@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 import math
+import sys
 from types import MappingProxyType
 from typing import Annotated, Literal, Mapping
 
@@ -22,6 +23,10 @@ from pi_engine.schemas.state import StateEstimate
 NonEmptyString = Annotated[str, Field(min_length=1)]
 # Accept no more than one part per billion of floating-point summation drift.
 PROBABILITY_SUM_TOLERANCE = 1e-9
+
+
+class TrajectorySummaryError(ValueError):
+    """Aligned finite samples could not produce representable statistics."""
 
 
 class _ImmutablePredictionSchema(BaseModel):
@@ -291,12 +296,50 @@ def summarize_trajectories(
         statistics: dict[str, ScalarSummaryStatistics] = {}
         for variable, values in values_by_variable.items():
             count = len(values)
-            mean = math.fsum(values) / count
-            variance = math.fsum((value - mean) ** 2 for value in values) / count
+            scale = max(abs(value) for value in values)
+            if scale == 0.0:
+                mean = 0.0
+                normalized_variance = 0.0
+            else:
+                normalized_values = tuple(value / scale for value in values)
+                normalized_mean = math.fsum(normalized_values) / count
+                mean = scale * normalized_mean
+                normalized_variance = (
+                    math.fsum(
+                        (value - normalized_mean) ** 2
+                        for value in normalized_values
+                    )
+                    / count
+                )
+            if not math.isfinite(mean):
+                raise TrajectorySummaryError(
+                    f"summary mean is not representable for {variable}"
+                )
+            if normalized_variance == 0.0:
+                standard_deviation = 0.0
+                variance = 0.0
+            else:
+                standard_deviation = scale * math.sqrt(normalized_variance)
+                if not math.isfinite(standard_deviation):
+                    raise TrajectorySummaryError(
+                        "summary population standard deviation is not "
+                        f"representable for {variable}"
+                    )
+                if standard_deviation > math.sqrt(sys.float_info.max):
+                    raise TrajectorySummaryError(
+                        "summary population variance is not representable "
+                        f"for {variable}"
+                    )
+                variance = standard_deviation * standard_deviation
+                if variance == 0.0:
+                    raise TrajectorySummaryError(
+                        "summary population variance is not representable "
+                        f"for {variable}"
+                    )
             statistics[variable] = ScalarSummaryStatistics(
                 count=count,
                 mean=float(mean),
-                population_std=float(math.sqrt(variance)),
+                population_std=float(standard_deviation),
                 population_variance=float(variance),
                 minimum=float(min(values)),
                 maximum=float(max(values)),
@@ -356,6 +399,7 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
         expected = (self.model_id, self.model_version, self.case_id)
         expected_initial_state = self.trajectories[0].initial_state
         expected_horizon = self.trajectories[0].horizon
+        expected_constraints = self.trajectories[0].constraints_encountered
         trajectory_ids = {
             trajectory.trajectory_id for trajectory in self.trajectories
         }
@@ -388,6 +432,10 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
             if trajectory.horizon != expected_horizon:
                 raise ValueError(
                     "trajectory ensemble members must share requested horizon"
+                )
+            if trajectory.constraints_encountered != expected_constraints:
+                raise ValueError(
+                    "trajectory ensemble members must share encountered constraints"
                 )
 
         weights = [trajectory.scenario_weight for trajectory in self.trajectories]

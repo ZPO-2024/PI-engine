@@ -166,8 +166,14 @@ def simulate_stochastic(
             f"model predicts a variable not declared by the case: {variable}"
         )
 
-    cutoff_utc = validated_case.prediction_cutoff.astimezone(UTC)
-    if validated_case.state.at.astimezone(UTC) != cutoff_utc:
+    try:
+        cutoff_utc = validated_case.prediction_cutoff.astimezone(UTC)
+        state_at_utc = validated_case.state.at.astimezone(UTC)
+    except OverflowError as exc:
+        raise StochasticSimulationError(
+            "UTC normalization exceeds the supported datetime range"
+        ) from exc
+    if state_at_utc != cutoff_utc:
         raise StochasticSimulationError(
             "case current state must be estimated at the prediction cutoff"
         )
@@ -209,7 +215,7 @@ def simulate_stochastic(
         sample_seed = int(
             child_sequence.generate_state(1, dtype=np.uint64)[0]
         )
-        rng = np.random.default_rng(child_sequence)
+        rng = np.random.default_rng(sample_seed)
         current_state = _current_state_values(validated_case)
         current_value = current_state.get(variable)
         if isinstance(current_value, tuple) or not isinstance(
@@ -226,9 +232,15 @@ def simulate_stochastic(
                 raise StochasticSimulationError(
                     f"executor produced nonfinite state for {variable}"
                 )
+            try:
+                point_at = cutoff_utc + step_delta * step
+            except OverflowError as exc:
+                raise StochasticSimulationError(
+                    "requested point exceeds the supported datetime range"
+                ) from exc
             points.append(
                 TrajectoryPoint(
-                    at=cutoff_utc + step_delta * step,
+                    at=point_at,
                     values={variable: current},
                 )
             )
