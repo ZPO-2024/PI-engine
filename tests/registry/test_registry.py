@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from pi_engine.registry import ModelRegistry
+from pi_engine.registry import ModelRegistry, rank_applicable_models
 from pi_engine.schemas.case import Case, VariableDefinition
 from pi_engine.schemas.common import Confidence, Provenance
 from pi_engine.schemas.graph import GraphNode, SystemGraph
@@ -300,3 +300,102 @@ def test_routing_returns_deeply_immutable_json_audit_records() -> None:
         result.rank = 2
     with pytest.raises(TypeError):
         result.reasons[0] = "changed"
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        True,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        (),
+        (1.0, True),
+        (1.0, float("nan")),
+        (1.0, float("inf")),
+    ],
+)
+def test_routing_revalidates_unchecked_current_state_values(
+    invalid_value: object,
+) -> None:
+    """Unchecked scalar/vector values must not bypass finite numeric hard gates."""
+    invalid_state = StateEstimate.model_construct(
+        at=NOW,
+        observed={"flow": invalid_value},
+        latent={},
+        uncertainty={},
+        boundary={},
+    )
+    unchecked_case = make_case().model_copy(update={"state": invalid_state})
+    registry = ModelRegistry()
+    registry.register(make_model())
+
+    with pytest.raises(ValidationError):
+        registry.rank_applicable_models(unchecked_case)
+
+
+@pytest.mark.parametrize(
+    "invalid_range",
+    [
+        (True, 100.0),
+        (0.0, False),
+        (float("nan"), 100.0),
+        (0.0, float("inf")),
+        (float("-inf"), 100.0),
+    ],
+)
+def test_routing_revalidates_unchecked_valid_range_endpoints(
+    invalid_range: tuple[object, object],
+) -> None:
+    """Unchecked endpoints must be rejected before applicability comparisons."""
+    model = make_model()
+    invalid_applicability = model.applicability.model_copy(
+        update={"valid_ranges": {"flow": invalid_range}}
+    )
+    unchecked_model = model.model_copy(
+        update={"applicability": invalid_applicability}
+    )
+
+    with pytest.raises(ValidationError):
+        rank_applicable_models(make_case(), (unchecked_model,))
+
+
+@pytest.mark.parametrize("topology_value", [False, None, 0, ""])
+def test_routing_rejects_nonaffirmative_topology_metadata(
+    topology_value: object,
+) -> None:
+    """Presence of a falsy topology value must not satisfy a requirement."""
+    registry = ModelRegistry()
+    registry.register(make_model(topology_requirements=("directed",)))
+
+    result = registry.rank_applicable_models(
+        make_case(topology_metadata={"directed": topology_value})
+    )[0]
+
+    assert result.applicable is False
+    assert (
+        "topology requirement not affirmative: directed"
+        in result.rejection_causes
+    )
+
+
+def test_range_audit_order_is_independent_of_mapping_insertion_order() -> None:
+    """Equivalent range maps must produce byte-for-byte stable audit structures."""
+    forward_model = make_model(
+        required_variables=("flow", "rainfall"),
+        valid_ranges={"flow": (0.0, 100.0), "rainfall": (0.0, 10.0)},
+    )
+    reverse_model = make_model(
+        required_variables=("flow", "rainfall"),
+        valid_ranges={"rainfall": (0.0, 10.0), "flow": (0.0, 100.0)},
+    )
+    case = make_case(latent={"rainfall": 5.0})
+
+    forward = rank_applicable_models(case, (forward_model,))[0]
+    reverse = rank_applicable_models(case, (reverse_model,))[0]
+
+    assert forward.model_dump(mode="json") == reverse.model_dump(mode="json")
+    assert forward.reasons[2:4] == (
+        "range satisfied: flow",
+        "range satisfied: rainfall",
+    )

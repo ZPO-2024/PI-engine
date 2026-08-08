@@ -211,6 +211,33 @@ def test_state_accepts_numeric_vectors_and_round_trips_as_json() -> None:
     }
 
 
+def test_state_accepts_integer_scalar_and_vector_inputs_as_floats() -> None:
+    """Making finite floats strict must not reject ordinary integer measurements."""
+    state = StateEstimate(
+        at=CUTOFF,
+        observed={"flow": 12},
+        latent={"rainfall": [2, 3]},
+        uncertainty={},
+        boundary={},
+    )
+
+    assert state.observed["flow"] == 12.0
+    assert state.latent["rainfall"] == (2.0, 3.0)
+
+
+@pytest.mark.parametrize("value", [True, [1.0, True]])
+def test_state_rejects_boolean_scalar_or_vector_elements(value: object) -> None:
+    """Coercing booleans to 0/1 would admit nonnumeric current-state values."""
+    with pytest.raises(ValidationError):
+        StateEstimate(
+            at=CUTOFF,
+            observed={"flow": value},
+            latent={},
+            uncertainty={},
+            boundary={},
+        )
+
+
 @pytest.mark.parametrize("component", ["observed", "latent", "uncertainty", "boundary"])
 def test_state_rejects_nonfinite_vector_in_each_component(component: str) -> None:
     """A nonfinite state vector would make simulation inputs non-serializable."""

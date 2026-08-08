@@ -62,11 +62,29 @@ class ApplicabilitySpec(_ImmutableSchema):
 
     @model_validator(mode="after")
     def validate_variable_roles_and_ranges(self) -> "ApplicabilitySpec":
+        variable_groups = {
+            "required_variables": self.required_variables,
+            "optional_variables": self.optional_variables,
+        }
+        for field_name, variables in variable_groups.items():
+            if len(variables) != len(set(variables)):
+                raise ValueError(f"{field_name} contains duplicate variables")
+
         overlap = set(self.required_variables) & set(self.optional_variables)
         if overlap:
             overlap_text = ", ".join(sorted(overlap))
             raise ValueError(
                 f"variables cannot be both required and optional: {overlap_text}"
+            )
+
+        declared_variables = set(self.required_variables) | set(
+            self.optional_variables
+        )
+        orphan_ranges = set(self.valid_ranges) - declared_variables
+        if orphan_ranges:
+            orphan_text = ", ".join(sorted(orphan_ranges))
+            raise ValueError(
+                f"valid range keys must reference a declared variable: {orphan_text}"
             )
 
         for variable, (lower, upper) in self.valid_ranges.items():

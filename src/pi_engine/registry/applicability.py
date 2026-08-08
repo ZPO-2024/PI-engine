@@ -28,7 +28,14 @@ def rank_applicable_models(
     case: Case, models: Iterable[ExplicitModel]
 ) -> tuple[ApplicabilityResult, ...]:
     """Evaluate every model and return a deterministic, tie-preserving ranking."""
-    evaluated = [_evaluate_model(case, model) for model in models]
+    validated_case = Case.model_validate(case.model_dump(warnings=False))
+    validated_models = tuple(
+        ExplicitModel.model_validate(model.model_dump(warnings=False))
+        for model in models
+    )
+    evaluated = [
+        _evaluate_model(validated_case, model) for model in validated_models
+    ]
     evaluated.sort(
         key=lambda item: (
             not item.applicable,
@@ -60,7 +67,7 @@ def _evaluate_model(case: Case, model: ExplicitModel) -> ApplicabilityResult:
         definition.name for definition in case.canonical_variables
     }
     constraints = set(case.constraints)
-    topology_tokens = set(case.graph.topology_metadata)
+    topology_metadata = case.graph.topology_metadata
     spec = model.applicability
     reasons: list[str] = []
     rejection_causes: list[str] = []
@@ -72,7 +79,8 @@ def _evaluate_model(case: Case, model: ExplicitModel) -> ApplicabilityResult:
             rejection_causes.append(f"missing required variable: {variable}")
 
     current_values = _current_state_values(case)
-    for variable, valid_range in spec.valid_ranges.items():
+    for variable in sorted(spec.valid_ranges):
+        valid_range = spec.valid_ranges[variable]
         values = current_values.get(variable, ())
         if not values:
             rejection_causes.append(
@@ -87,10 +95,14 @@ def _evaluate_model(case: Case, model: ExplicitModel) -> ApplicabilityResult:
             reasons.append(f"range satisfied: {variable}")
 
     for token in spec.topology_requirements:
-        if token in topology_tokens:
+        if token not in topology_metadata:
+            rejection_causes.append(f"missing topology requirement: {token}")
+        elif topology_metadata[token]:
             reasons.append(f"topology requirement satisfied: {token}")
         else:
-            rejection_causes.append(f"missing topology requirement: {token}")
+            rejection_causes.append(
+                f"topology requirement not affirmative: {token}"
+            )
 
     for token in spec.boundary_conditions:
         if token in constraints:

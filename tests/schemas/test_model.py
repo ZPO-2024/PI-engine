@@ -203,6 +203,39 @@ def test_applicability_rejects_overlapping_required_and_optional_variables() -> 
         ExplicitModel.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    ("field", "variables"),
+    [
+        ("required_variables", ("flow", "flow")),
+        ("optional_variables", ("temperature", "temperature")),
+    ],
+)
+def test_applicability_rejects_duplicate_variable_declarations(
+    field: str, variables: tuple[str, ...]
+) -> None:
+    """Duplicate declarations would inflate compatibility evidence or repeat gates."""
+    payload = model_payload()
+    payload["applicability"] = {
+        **payload["applicability"],
+        field: variables,
+    }
+
+    with pytest.raises(ValidationError, match="duplicate"):
+        ExplicitModel.model_validate(payload)
+
+
+def test_applicability_rejects_valid_range_for_undeclared_variable() -> None:
+    """An orphan range cannot be interpreted as required or optional applicability."""
+    payload = model_payload()
+    payload["applicability"] = {
+        **payload["applicability"],
+        "valid_ranges": {"pressure": (0.0, 10.0)},
+    }
+
+    with pytest.raises(ValidationError, match="declared variable"):
+        ExplicitModel.model_validate(payload)
+
+
 def test_applicability_rejects_inverted_valid_range() -> None:
     """An inverted range could never match a valid case value."""
     payload = model_payload()
@@ -212,6 +245,30 @@ def test_applicability_rejects_inverted_valid_range() -> None:
     }
 
     with pytest.raises(ValidationError, match="valid range"):
+        ExplicitModel.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "valid_range",
+    [
+        (True, 10.0),
+        (0.0, False),
+        (float("nan"), 10.0),
+        (0.0, float("inf")),
+        (float("-inf"), 10.0),
+    ],
+)
+def test_applicability_rejects_boolean_or_nonfinite_range_endpoints(
+    valid_range: tuple[object, object]
+) -> None:
+    """Malformed endpoints could make every range comparison evaluate as allowed."""
+    payload = model_payload()
+    payload["applicability"] = {
+        **payload["applicability"],
+        "valid_ranges": {"flow": valid_range},
+    }
+
+    with pytest.raises(ValidationError):
         ExplicitModel.model_validate(payload)
 
 
