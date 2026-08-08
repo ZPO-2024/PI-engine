@@ -1,0 +1,448 @@
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from pydantic import ValidationError
+
+from pi_engine.schemas.common import Provenance
+from pi_engine.schemas.outcome import ComparisonWindow, Outcome
+from pi_engine.schemas.residual import (
+    Residual,
+    ResidualCategory,
+    ResidualClassification,
+)
+from pi_engine.schemas.state import StateEstimate
+from pi_engine.schemas.trajectory import (
+    ScenarioWeight,
+    Trajectory,
+    TrajectoryEnsemble,
+    TrajectoryHorizon,
+    TrajectoryPoint,
+)
+
+
+START = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+END = START + timedelta(hours=6)
+
+
+def provenance(source: str = "PI-engine deterministic runner") -> Provenance:
+    return Provenance(
+        source=source,
+        observed_at=START,
+        reference="run:river-linear-decay:case-river-1",
+    )
+
+
+def trajectory_payload(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "trajectory_id": "trajectory-river-1",
+        "model_id": "river-linear-decay",
+        "model_version": "1.2.0",
+        "case_id": "case-river-1",
+        "initial_state": StateEstimate(
+            at=START,
+            observed={"flow": 12.5},
+            latent={"rainfall": 2.0},
+            uncertainty={"flow": 0.4},
+            boundary={"rainfall": 2.0},
+        ),
+        "horizon": TrajectoryHorizon(start_at=START, end_at=END),
+        "points": (
+            TrajectoryPoint(at=START, values={"flow": 12.5}),
+            TrajectoryPoint(at=END, values={"flow": 8.25}),
+        ),
+        "scenario_weight": ScenarioWeight(
+            kind="probability",
+            value=0.65,
+            justification="normalized branching probabilities from the model",
+        ),
+        "constraints_encountered": ("flow >= 0",),
+        "provenance": provenance(),
+    }
+    values.update(overrides)
+    return values
+
+
+def outcome_payload(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "outcome_id": "outcome-flow-window-1",
+        "case_id": "case-river-1",
+        "variable": "flow",
+        "unit": "m^3/s",
+        "value": 8.0,
+        "event_time": END,
+        "available_at": END + timedelta(minutes=15),
+        "comparison_window": ComparisonWindow(
+            start_at=END - timedelta(minutes=30),
+            end_at=END + timedelta(minutes=30),
+        ),
+        "provenance": provenance("USGS held-out stream gauge export"),
+    }
+    values.update(overrides)
+    return values
+
+
+def residual_payload(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "residual_id": "residual-flow-1",
+        "model_id": "river-linear-decay",
+        "model_version": "1.2.0",
+        "case_id": "case-river-1",
+        "variable": "flow",
+        "unit": "m^3/s",
+        "predicted_value": 8.25,
+        "predicted_distribution_ref": None,
+        "observed_outcome": Outcome.model_validate(outcome_payload()),
+        "error": 0.25,
+        "error_convention": "predicted_minus_observed",
+        "classification": ResidualClassification(
+            category=ResidualCategory.MODEL_DISCREPANCY,
+            basis="persistent signed error outside the declared model envelope",
+        ),
+        "provenance": provenance("PI-engine holdout comparison"),
+    }
+    values.update(overrides)
+    return values
+
+
+def test_trajectory_round_trip_preserves_runner_inputs_and_audit_fields() -> None:
+    """Dropping runner identity, state, horizon, or constraints breaks reproducibility."""
+    trajectory = Trajectory.model_validate(trajectory_payload())
+    dumped = trajectory.model_dump(mode="json")
+
+    assert dumped == {
+        "trajectory_id": "trajectory-river-1",
+        "model_id": "river-linear-decay",
+        "model_version": "1.2.0",
+        "case_id": "case-river-1",
+        "initial_state": {
+            "at": "2026-08-08T12:00:00Z",
+            "observed": {"flow": 12.5},
+            "latent": {"rainfall": 2.0},
+            "uncertainty": {"flow": 0.4},
+            "boundary": {"rainfall": 2.0},
+        },
+        "horizon": {
+            "start_at": "2026-08-08T12:00:00Z",
+            "end_at": "2026-08-08T18:00:00Z",
+        },
+        "points": [
+            {"at": "2026-08-08T12:00:00Z", "values": {"flow": 12.5}},
+            {"at": "2026-08-08T18:00:00Z", "values": {"flow": 8.25}},
+        ],
+        "scenario_weight": {
+            "kind": "probability",
+            "value": 0.65,
+            "justification": "normalized branching probabilities from the model",
+        },
+        "constraints_encountered": ["flow >= 0"],
+        "provenance": {
+            "source": "PI-engine deterministic runner",
+            "observed_at": "2026-08-08T12:00:00Z",
+            "reference": "run:river-linear-decay:case-river-1",
+        },
+    }
+    assert Trajectory.model_validate_json(trajectory.model_dump_json()) == trajectory
+
+
+def test_trajectory_supports_unweighted_deterministic_scenario() -> None:
+    """Requiring a fabricated probability would misrepresent deterministic output."""
+    trajectory = Trajectory.model_validate(
+        trajectory_payload(scenario_weight=None)
+    )
+
+    assert trajectory.scenario_weight is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "value"),
+    [("probability", -0.01), ("probability", 1.01), ("relative_weight", -0.01)],
+)
+def test_scenario_weight_rejects_invalid_numeric_bounds(
+    kind: str, value: float
+) -> None:
+    """Invalid probability or weight bounds would corrupt ensemble semantics."""
+    with pytest.raises(ValidationError, match="value"):
+        ScenarioWeight(kind=kind, value=value, justification="model branch weight")
+
+
+def test_trajectory_rejects_misaligned_or_unordered_points() -> None:
+    """Points outside or out of order within the horizon make a path ambiguous."""
+    with pytest.raises(ValidationError, match="strictly ordered"):
+        Trajectory.model_validate(
+            trajectory_payload(
+                points=(
+                    TrajectoryPoint(at=END, values={"flow": 8.25}),
+                    TrajectoryPoint(at=START, values={"flow": 12.5}),
+                )
+            )
+        )
+
+
+def test_trajectory_nested_values_are_deeply_immutable() -> None:
+    """Mutating validated state or points would silently change a prediction record."""
+    trajectory = Trajectory.model_validate(trajectory_payload())
+
+    with pytest.raises(TypeError):
+        trajectory.points[0].values["flow"] = 99.0
+    with pytest.raises(TypeError):
+        trajectory.initial_state.observed["flow"] = 99.0
+    with pytest.raises(ValidationError):
+        trajectory.model_version = "2.0.0"
+
+
+def test_trajectory_rejects_nonfinite_point_and_preconstructed_nested_values() -> None:
+    """NaN or construct-bypassed nested objects must not enter a trajectory."""
+    invalid_point = TrajectoryPoint.model_construct(
+        at=datetime(2026, 8, 8, 13, 0), values={"flow": float("nan")}
+    )
+    invalid_state = StateEstimate.model_construct(
+        at=START,
+        observed={"flow": float("inf")},
+        latent={},
+        uncertainty={},
+        boundary={},
+    )
+
+    with pytest.raises(ValidationError):
+        Trajectory.model_validate(
+            trajectory_payload(points=(invalid_point,), initial_state=invalid_state)
+        )
+
+
+def test_trajectory_ensemble_round_trip_retains_raw_samples_and_seed() -> None:
+    """Collapsing samples or omitting the seed would prevent stochastic replay."""
+    first = Trajectory.model_validate(trajectory_payload())
+    second = Trajectory.model_validate(
+        trajectory_payload(
+            trajectory_id="trajectory-river-2",
+            points=(
+                TrajectoryPoint(at=START, values={"flow": 12.5}),
+                TrajectoryPoint(at=END, values={"flow": 7.75}),
+            ),
+            scenario_weight=ScenarioWeight(
+                kind="probability",
+                value=0.35,
+                justification="normalized branching probabilities from the model",
+            ),
+        )
+    )
+    ensemble = TrajectoryEnsemble(
+        ensemble_id="ensemble-river-1",
+        model_id="river-linear-decay",
+        model_version="1.2.0",
+        case_id="case-river-1",
+        trajectories=(first, second),
+        seed=9173,
+        provenance=provenance("PI-engine stochastic runner"),
+    )
+
+    assert [item["trajectory_id"] for item in ensemble.model_dump(mode="json")["trajectories"]] == [
+        "trajectory-river-1",
+        "trajectory-river-2",
+    ]
+    assert ensemble.seed == 9173
+    assert TrajectoryEnsemble.model_validate_json(ensemble.model_dump_json()) == ensemble
+
+
+def test_trajectory_ensemble_rejects_mixed_model_or_case_identity() -> None:
+    """Mixing unrelated trajectories would make ensemble summaries invalid."""
+    mismatched = Trajectory.model_validate(
+        trajectory_payload(case_id="case-river-2")
+    )
+
+    with pytest.raises(ValidationError, match="identity"):
+        TrajectoryEnsemble(
+            ensemble_id="ensemble-river-1",
+            model_id="river-linear-decay",
+            model_version="1.2.0",
+            case_id="case-river-1",
+            trajectories=(mismatched,),
+            seed=9173,
+            provenance=provenance("PI-engine stochastic runner"),
+        )
+
+
+def test_outcome_round_trip_preserves_withheld_value_timing_window_and_source() -> None:
+    """Losing withheld timing, units, or source makes forecast comparison unauditable."""
+    outcome = Outcome.model_validate(outcome_payload())
+
+    assert outcome.model_dump(mode="json") == {
+        "outcome_id": "outcome-flow-window-1",
+        "case_id": "case-river-1",
+        "variable": "flow",
+        "unit": "m^3/s",
+        "value": 8.0,
+        "event_time": "2026-08-08T18:00:00Z",
+        "available_at": "2026-08-08T18:15:00Z",
+        "comparison_window": {
+            "start_at": "2026-08-08T17:30:00Z",
+            "end_at": "2026-08-08T18:30:00Z",
+        },
+        "provenance": {
+            "source": "USGS held-out stream gauge export",
+            "observed_at": "2026-08-08T12:00:00Z",
+            "reference": "run:river-linear-decay:case-river-1",
+        },
+    }
+    assert Outcome.model_validate_json(outcome.model_dump_json()) == outcome
+
+
+def test_outcome_allows_point_comparison_without_fabricated_window() -> None:
+    """Point outcomes should not require an inapplicable comparison interval."""
+    outcome = Outcome.model_validate(outcome_payload(comparison_window=None))
+
+    assert outcome.comparison_window is None
+
+
+@pytest.mark.parametrize("field", ["event_time", "available_at"])
+def test_outcome_requires_timezone_aware_timing(field: str) -> None:
+    """Naive held-out times make cutoff and comparison ordering ambiguous."""
+    with pytest.raises(ValidationError, match=field):
+        Outcome.model_validate(
+            outcome_payload(**{field: datetime(2026, 8, 8, 18, 0)})
+        )
+
+
+def test_outcome_rejects_nonfinite_values_and_nested_validation_bypass() -> None:
+    """Non-finite values or invalid constructed provenance must fail structurally."""
+    invalid_provenance = Provenance.model_construct(source="", observed_at=START)
+
+    with pytest.raises(ValidationError):
+        Outcome.model_validate(
+            outcome_payload(value=float("inf"), provenance=invalid_provenance)
+        )
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        ResidualCategory.PROCESS_NOISE,
+        ResidualCategory.PARAMETER_UNCERTAINTY,
+        ResidualCategory.MODEL_DISCREPANCY,
+        ResidualCategory.PHASE_TIMING,
+        ResidualCategory.TOPOLOGY_COUPLING,
+        ResidualCategory.MISSING_VARIABLE,
+        ResidualCategory.REGIME_CHANGE,
+        ResidualCategory.STRUCTURED_UNKNOWN,
+    ],
+)
+def test_residual_round_trip_preserves_each_distinct_provisional_category(
+    category: ResidualCategory,
+) -> None:
+    """Collapsing distinct residual causes would erase evidence for later analysis."""
+    payload = residual_payload(
+        classification=ResidualClassification(
+            category=category,
+            basis=f"provisional evidence for {category.value}",
+        )
+    )
+    residual = Residual.model_validate(payload)
+
+    assert residual.model_dump(mode="json")["classification"] == {
+        "category": category.value,
+        "basis": f"provisional evidence for {category.value}",
+    }
+    assert Residual.model_validate_json(residual.model_dump_json()) == residual
+
+
+def test_residual_requires_explicit_classification_instead_of_defaulting_to_noise() -> None:
+    """An unexplained residual must never be silently classified as process noise."""
+    payload = residual_payload()
+    del payload["classification"]
+
+    with pytest.raises(ValidationError) as exc_info:
+        Residual.model_validate(payload)
+
+    assert exc_info.value.errors()[0]["loc"] == ("classification",)
+    assert exc_info.value.errors()[0]["type"] == "missing"
+
+
+def test_residual_preserves_distribution_reference_without_fabricated_point_value() -> None:
+    """Distribution predictions must remain referentially intact when no point exists."""
+    residual = Residual.model_validate(
+        residual_payload(
+            predicted_value=None,
+            predicted_distribution_ref="ensemble:river-flow:quantiles:v1",
+        )
+    )
+
+    assert residual.predicted_value is None
+    assert residual.predicted_distribution_ref == "ensemble:river-flow:quantiles:v1"
+
+
+def test_residual_requires_a_predicted_value_or_distribution_reference() -> None:
+    """A residual without a prediction cannot represent forecast error."""
+    with pytest.raises(ValidationError, match="predicted value or distribution"):
+        Residual.model_validate(
+            residual_payload(predicted_value=None, predicted_distribution_ref=None)
+        )
+
+
+def test_residual_rejects_outcome_identity_mismatch() -> None:
+    """Comparing a prediction to another case or variable would corrupt evaluation."""
+    other_outcome = Outcome.model_validate(outcome_payload(variable="rainfall", unit="mm/h"))
+
+    with pytest.raises(ValidationError, match="identity"):
+        Residual.model_validate(residual_payload(observed_outcome=other_outcome))
+
+
+def test_residual_revalidates_constructed_outcome_and_classification() -> None:
+    """Constructed nested instances must not bypass outcome or classification rules."""
+    invalid_outcome = Outcome.model_construct(**outcome_payload(value=float("nan")))
+    invalid_classification = ResidualClassification.model_construct(
+        category=ResidualCategory.PROCESS_NOISE,
+        basis="",
+    )
+
+    with pytest.raises(ValidationError):
+        Residual.model_validate(
+            residual_payload(
+                observed_outcome=invalid_outcome,
+                classification=invalid_classification,
+            )
+        )
+
+
+def test_prediction_schemas_forbid_extra_fields() -> None:
+    """Unrecognized fields could conceal behavior or mutable prediction state."""
+    samples = (
+        (TrajectoryHorizon, {"start_at": START, "end_at": END}),
+        (TrajectoryPoint, {"at": START, "values": {"flow": 12.5}}),
+        (
+            ScenarioWeight,
+            {
+                "kind": "probability",
+                "value": 0.65,
+                "justification": "model branch probability",
+            },
+        ),
+        (Trajectory, trajectory_payload()),
+        (
+            TrajectoryEnsemble,
+            {
+                "ensemble_id": "ensemble-river-1",
+                "model_id": "river-linear-decay",
+                "model_version": "1.2.0",
+                "case_id": "case-river-1",
+                "trajectories": (Trajectory.model_validate(trajectory_payload()),),
+                "seed": 9173,
+                "provenance": provenance("PI-engine stochastic runner"),
+            },
+        ),
+        (
+            ComparisonWindow,
+            {"start_at": END - timedelta(minutes=30), "end_at": END},
+        ),
+        (Outcome, outcome_payload()),
+        (
+            ResidualClassification,
+            {"category": "structured_unknown", "basis": "unexplained structure"},
+        ),
+        (Residual, residual_payload()),
+    )
+
+    for schema, payload in samples:
+        with pytest.raises(ValidationError) as exc_info:
+            schema.model_validate({**payload, "analysis_hook": "run_me"})
+        assert exc_info.value.errors()[0]["loc"] == ("analysis_hook",)
+        assert exc_info.value.errors()[0]["type"] == "extra_forbidden"
