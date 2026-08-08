@@ -1,6 +1,6 @@
 """Immutable model-conditioned trajectory and ensemble records."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Annotated, Literal, Mapping
 
@@ -155,7 +155,9 @@ class Trajectory(_ImmutablePredictionSchema):
 
     @model_validator(mode="after")
     def validate_timeline(self) -> "Trajectory":
-        if self.initial_state.at != self.horizon.start_at:
+        if self.initial_state.at.astimezone(UTC) != self.horizon.start_at.astimezone(
+            UTC
+        ):
             raise ValueError("initial state time must match horizon start_at")
 
         previous_at: datetime | None = None

@@ -1,6 +1,6 @@
 """Public deterministic simulation boundary."""
 
-from datetime import timedelta
+from datetime import UTC, timedelta
 from hashlib import sha256
 import json
 import math
@@ -18,6 +18,7 @@ from pi_engine.schemas.trajectory import (
 from pi_engine.simulation.deterministic import (
     DeterministicSimulationError,
     resolve_deterministic_executor,
+    validate_deterministic_output_contract,
 )
 
 
@@ -122,7 +123,8 @@ def simulate_deterministic(
         raise InapplicableModelError(applicability.rejection_causes)
 
     contract = resolve_deterministic_executor(validated_model.dynamics)
-    if validated_case.state.at != validated_case.prediction_cutoff:
+    cutoff_utc = validated_case.prediction_cutoff.astimezone(UTC)
+    if validated_case.state.at.astimezone(UTC) != cutoff_utc:
         raise DeterministicSimulationError(
             "case current state must be estimated at the prediction cutoff"
         )
@@ -143,13 +145,16 @@ def simulate_deterministic(
         raise DeterministicSimulationError(
             f"model predicts variables not declared by the case: {names}"
         )
+    validate_deterministic_output_contract(
+        contract,
+        validated_model.dynamics,
+        validated_model.predicted_outputs,
+    )
 
     step_seconds = _step_seconds(validated_model.dynamics.transition_metadata)
     try:
         step_delta = timedelta(seconds=step_seconds)
-        end_at = (
-            validated_case.prediction_cutoff + step_delta * step_count
-        )
+        end_at = cutoff_utc + step_delta * step_count
     except OverflowError as exc:
         raise DeterministicSimulationError(
             "requested horizon exceeds the supported datetime range"
@@ -194,7 +199,7 @@ def simulate_deterministic(
             point_values[variable] = value
         points.append(
             TrajectoryPoint(
-                at=validated_case.prediction_cutoff + step_delta * step,
+                at=cutoff_utc + step_delta * step,
                 values=point_values,
             )
         )
@@ -209,7 +214,7 @@ def simulate_deterministic(
         case_id=validated_case.case_id,
         initial_state=validated_case.state,
         horizon=TrajectoryHorizon(
-            start_at=validated_case.prediction_cutoff,
+            start_at=cutoff_utc,
             end_at=end_at,
         ),
         points=tuple(points),
@@ -217,7 +222,7 @@ def simulate_deterministic(
         constraints_encountered=validated_case.constraints,
         provenance=Provenance(
             source="PI-engine deterministic runner",
-            observed_at=validated_case.prediction_cutoff,
+            observed_at=cutoff_utc,
             reference=f"run:{trajectory_id}",
         ),
     )

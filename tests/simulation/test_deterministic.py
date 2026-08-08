@@ -1,9 +1,12 @@
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from importlib import import_module
+from itertools import pairwise
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
 
+from pi_engine.schemas.case import VariableDefinition
 from pi_engine.synthetic.systems import (
     coupled_oscillators,
     deterministic_divergence,
@@ -51,6 +54,109 @@ def test_planar_rotation_updates_both_values_from_the_prior_state() -> None:
         {"position": -1.0, "velocity": 0.0},
         {"position": 0.0, "velocity": 1.0},
     ]
+
+
+@pytest.mark.parametrize(
+    ("month", "day", "hour", "fold", "expected_utc_points"),
+    [
+        (
+            3,
+            8,
+            1,
+            0,
+            (
+                datetime(2026, 3, 8, 7, 30, tzinfo=UTC),
+                datetime(2026, 3, 8, 8, 30, tzinfo=UTC),
+                datetime(2026, 3, 8, 9, 30, tzinfo=UTC),
+            ),
+        ),
+        (
+            11,
+            1,
+            1,
+            0,
+            (
+                datetime(2026, 11, 1, 6, 30, tzinfo=UTC),
+                datetime(2026, 11, 1, 7, 30, tzinfo=UTC),
+                datetime(2026, 11, 1, 8, 30, tzinfo=UTC),
+            ),
+        ),
+    ],
+    ids=("spring-forward", "fall-back"),
+)
+def test_fixed_steps_advance_in_absolute_time_across_dst_transitions(
+    month: int,
+    day: int,
+    hour: int,
+    fold: int,
+    expected_utc_points: tuple[datetime, ...],
+) -> None:
+    """Wall-time arithmetic would duplicate or skip an absolute-time step."""
+    fixture = linear_convergence(seed=7)
+    cutoff = datetime(
+        2026, month, day, hour, 30,
+        tzinfo=ZoneInfo("America/New_York"),
+        fold=fold,
+    )
+    state = fixture.case.state.model_copy(update={"at": cutoff})
+    case = fixture.case.model_copy(
+        update={
+            "prediction_cutoff": cutoff,
+            "observations": (),
+            "state": state,
+        }
+    )
+    runner = import_module("pi_engine.simulation.runner")
+
+    trajectory = runner.simulate_deterministic(case, fixture.model, horizon=3)
+
+    assert trajectory.initial_state == case.state
+    assert tuple(point.at for point in trajectory.points) == expected_utc_points
+    timeline = (trajectory.horizon.start_at,) + tuple(
+        point.at for point in trajectory.points
+    )
+    assert [
+        later.timestamp() - earlier.timestamp()
+        for earlier, later in pairwise(timeline)
+    ] == [3600.0, 3600.0, 3600.0]
+    assert all(
+        earlier < later
+        for earlier, later in pairwise(timeline)
+    )
+    assert all(value.tzinfo is UTC for value in timeline)
+
+
+def test_cutoff_alignment_compares_absolute_instants_in_repeated_hour() -> None:
+    """Equivalent UTC/local state times must align during an ambiguous hour."""
+    fixture = linear_convergence(seed=7)
+    cutoff = datetime(
+        2026,
+        11,
+        1,
+        1,
+        30,
+        tzinfo=ZoneInfo("America/New_York"),
+        fold=0,
+    )
+    state = fixture.case.state.model_copy(update={"at": cutoff.astimezone(UTC)})
+    case = fixture.case.model_copy(
+        update={
+            "prediction_cutoff": cutoff,
+            "observations": (),
+            "state": state,
+        }
+    )
+    runner = import_module("pi_engine.simulation.runner")
+
+    trajectory = runner.simulate_deterministic(case, fixture.model, horizon=1)
+
+    assert trajectory.initial_state == state
+    assert trajectory.horizon.start_at == datetime(
+        2026, 11, 1, 5, 30, tzinfo=UTC
+    )
+    assert trajectory.points[0].at == datetime(
+        2026, 11, 1, 6, 30, tzinfo=UTC
+    )
 
 
 @pytest.mark.parametrize(
@@ -254,6 +360,114 @@ def test_runner_rejects_outputs_not_declared_by_the_model() -> None:
         runner.DeterministicSimulationError, match="undeclared outputs: velocity"
     ):
         runner.simulate_deterministic(fixture.case, model, horizon=1)
+
+
+@pytest.mark.parametrize(
+    ("factory", "variable_updates", "predicted_outputs"),
+    [
+        (
+            oscillation,
+            {
+                "position_variable": "position",
+                "velocity_variable": "position",
+            },
+            ("position",),
+        ),
+        (
+            coupled_oscillators,
+            {
+                "phase_a_variable": "phase_a",
+                "phase_b_variable": "phase_a",
+            },
+            ("phase_a",),
+        ),
+    ],
+    ids=("planar-rotation", "coupled-phase"),
+)
+def test_runner_rejects_aliased_multi_output_variable_metadata(
+    factory: object,
+    variable_updates: dict[str, str],
+    predicted_outputs: tuple[str, ...],
+) -> None:
+    """Aliased output names must not collapse two transitions into one key."""
+    fixture = factory(seed=7)
+    metadata = dict(fixture.model.dynamics.transition_metadata)
+    metadata.update(variable_updates)
+    dynamics = fixture.model.dynamics.model_copy(
+        update={"transition_metadata": metadata}
+    )
+    model = fixture.model.model_copy(
+        update={
+            "dynamics": dynamics,
+            "predicted_outputs": predicted_outputs,
+        }
+    )
+    runner = import_module("pi_engine.simulation.runner")
+
+    with pytest.raises(
+        runner.DeterministicSimulationError,
+        match="output variables must be distinct",
+    ):
+        runner.simulate_deterministic(fixture.case, model, horizon=1)
+
+
+@pytest.mark.parametrize(
+    ("factory", "retained_output"),
+    [(oscillation, "position"), (coupled_oscillators, "phase_a")],
+    ids=("planar-rotation", "coupled-phase"),
+)
+def test_multi_output_arity_is_checked_before_transition_state_reads(
+    factory: object, retained_output: str
+) -> None:
+    """Reduced declarations must fail before an executor reads its full state."""
+    fixture = factory(seed=7)
+    state = fixture.case.state.model_copy(
+        update={
+            "observed": {
+                retained_output: fixture.case.state.observed[retained_output]
+            },
+            "uncertainty": {retained_output: 0.0},
+        }
+    )
+    case = fixture.case.model_copy(update={"state": state})
+    model = fixture.model.model_copy(
+        update={"predicted_outputs": (retained_output,)}
+    )
+    runner = import_module("pi_engine.simulation.runner")
+
+    with pytest.raises(
+        runner.DeterministicSimulationError,
+        match="requires exactly 2 predicted outputs",
+    ):
+        runner.simulate_deterministic(case, model, horizon=1)
+
+
+def test_nested_linear_arity_is_checked_before_vector_state_transition() -> None:
+    """Extra declarations must fail before nested-linear reads vector shape."""
+    fixture = hierarchical_nested_dynamics(seed=7)
+    state = fixture.case.state.model_copy(
+        update={
+            "observed": {"levels": 1.0, "extra": 0.0},
+            "uncertainty": {"levels": 0.0, "extra": 0.0},
+        }
+    )
+    case = fixture.case.model_copy(
+        update={
+            "canonical_variables": fixture.case.canonical_variables
+            + (VariableDefinition(name="extra", unit="a.u."),),
+            "state": state,
+        }
+    )
+    model = fixture.model.model_copy(
+        update={"predicted_outputs": ("levels", "extra")}
+    )
+    runner = import_module("pi_engine.simulation.runner")
+
+    with pytest.raises(
+        runner.DeterministicSimulationError,
+        match="requires exactly 1 predicted output",
+    ):
+        runner.simulate_deterministic(case, model, horizon=1)
 
 
 def test_runner_rejects_duplicate_declared_outputs() -> None:

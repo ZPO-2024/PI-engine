@@ -29,7 +29,51 @@ class _ExecutorContract:
     executor_ref: str
     executor_version: str
     code_sha256: str
+    metadata_keys: frozenset[str]
+    output_variable_keys: tuple[str, ...]
     transition: Transition
+
+
+_LINEAR_AFFINE_METADATA_KEYS = frozenset(
+    {"state_variable", "multiplier", "intercept", "step_seconds"}
+)
+_PLANAR_ROTATION_METADATA_KEYS = frozenset(
+    {
+        "position_variable",
+        "velocity_variable",
+        "cosine",
+        "sine",
+        "step_seconds",
+    }
+)
+_COUPLED_PHASE_METADATA_KEYS = frozenset(
+    {
+        "phase_a_variable",
+        "phase_b_variable",
+        "intrinsic_step_a",
+        "intrinsic_step_b",
+        "coupling",
+        "step_seconds",
+    }
+)
+_LINEAR_FEEDBACK_METADATA_KEYS = frozenset(
+    {
+        "state_variable",
+        "plant_multiplier",
+        "feedback_gain",
+        "reference",
+        "step_seconds",
+    }
+)
+_NESTED_LINEAR_METADATA_KEYS = frozenset(
+    {
+        "state_variable",
+        "root_multiplier",
+        "level_multiplier",
+        "parent_coupling",
+        "step_seconds",
+    }
+)
 
 
 def _require_exact_metadata(
@@ -56,6 +100,51 @@ def _require_variable(
             f"transition metadata {key!r} must be a nonempty variable name"
         )
     return value
+
+
+def validate_deterministic_output_contract(
+    contract: _ExecutorContract,
+    dynamics: DynamicsSpec,
+    predicted_outputs: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Validate exact executor outputs before reading transition state."""
+    metadata = dynamics.transition_metadata
+    _require_exact_metadata(
+        metadata, contract.metadata_keys, contract.executor_ref
+    )
+    output_variables = tuple(
+        _require_variable(metadata, key)
+        for key in contract.output_variable_keys
+    )
+    if len(output_variables) != len(set(output_variables)):
+        keys = ", ".join(contract.output_variable_keys)
+        raise DeterministicSimulationError(
+            f"executor {contract.executor_ref!r} output variables must be "
+            f"distinct across metadata keys: {keys}"
+        )
+
+    required_arity = len(contract.output_variable_keys)
+    actual_outputs = set(output_variables)
+    predicted_output_set = set(predicted_outputs)
+    if (
+        len(predicted_outputs) != required_arity
+        or predicted_output_set != actual_outputs
+    ):
+        noun = "output" if required_arity == 1 else "outputs"
+        details = [
+            f"executor {contract.executor_ref!r} requires exactly "
+            f"{required_arity} predicted {noun}"
+        ]
+        undeclared = actual_outputs - predicted_output_set
+        missing = predicted_output_set - actual_outputs
+        if undeclared:
+            details.append(
+                "undeclared outputs: " + ", ".join(sorted(undeclared))
+            )
+        if missing:
+            details.append("missing outputs: " + ", ".join(sorted(missing)))
+        raise DeterministicSimulationError("; ".join(details))
+    return output_variables
 
 
 def _require_number(
@@ -100,9 +189,7 @@ def _linear_affine(
 ) -> dict[str, NumericValue]:
     _require_exact_metadata(
         metadata,
-        frozenset(
-            {"state_variable", "multiplier", "intercept", "step_seconds"}
-        ),
+        _LINEAR_AFFINE_METADATA_KEYS,
         "linear_affine",
     )
     variable = _require_variable(metadata, "state_variable")
@@ -117,15 +204,7 @@ def _planar_rotation(
 ) -> dict[str, NumericValue]:
     _require_exact_metadata(
         metadata,
-        frozenset(
-            {
-                "position_variable",
-                "velocity_variable",
-                "cosine",
-                "sine",
-                "step_seconds",
-            }
-        ),
+        _PLANAR_ROTATION_METADATA_KEYS,
         "planar_rotation",
     )
     position_variable = _require_variable(metadata, "position_variable")
@@ -145,16 +224,7 @@ def _coupled_phase(
 ) -> dict[str, NumericValue]:
     _require_exact_metadata(
         metadata,
-        frozenset(
-            {
-                "phase_a_variable",
-                "phase_b_variable",
-                "intrinsic_step_a",
-                "intrinsic_step_b",
-                "coupling",
-                "step_seconds",
-            }
-        ),
+        _COUPLED_PHASE_METADATA_KEYS,
         "coupled_phase",
     )
     phase_a_variable = _require_variable(metadata, "phase_a_variable")
@@ -179,15 +249,7 @@ def _linear_feedback(
 ) -> dict[str, NumericValue]:
     _require_exact_metadata(
         metadata,
-        frozenset(
-            {
-                "state_variable",
-                "plant_multiplier",
-                "feedback_gain",
-                "reference",
-                "step_seconds",
-            }
-        ),
+        _LINEAR_FEEDBACK_METADATA_KEYS,
         "linear_feedback",
     )
     variable = _require_variable(metadata, "state_variable")
@@ -206,15 +268,7 @@ def _nested_linear(
 ) -> dict[str, NumericValue]:
     _require_exact_metadata(
         metadata,
-        frozenset(
-            {
-                "state_variable",
-                "root_multiplier",
-                "level_multiplier",
-                "parent_coupling",
-                "step_seconds",
-            }
-        ),
+        _NESTED_LINEAR_METADATA_KEYS,
         "nested_linear",
     )
     variable = _require_variable(metadata, "state_variable")
@@ -238,6 +292,8 @@ _EXECUTOR_CONTRACTS = (
         code_sha256=(
             "20d2ac1b70f95a3492439992f268e6070d85a71f6af59a5e4e05d7b46d7c6384"
         ),
+        metadata_keys=_LINEAR_AFFINE_METADATA_KEYS,
+        output_variable_keys=("state_variable",),
         transition=_linear_affine,
     ),
     _ExecutorContract(
@@ -246,6 +302,8 @@ _EXECUTOR_CONTRACTS = (
         code_sha256=(
             "52d60c2ea883458cf5ebd90a5e75b68a02f4e40f8abd3e1b2155807d9ec9176e"
         ),
+        metadata_keys=_PLANAR_ROTATION_METADATA_KEYS,
+        output_variable_keys=("position_variable", "velocity_variable"),
         transition=_planar_rotation,
     ),
     _ExecutorContract(
@@ -254,6 +312,8 @@ _EXECUTOR_CONTRACTS = (
         code_sha256=(
             "7294decfc2c72c7d020d3264262b8389a6f324bbb75f59b79afc12fe3ab8cc75"
         ),
+        metadata_keys=_COUPLED_PHASE_METADATA_KEYS,
+        output_variable_keys=("phase_a_variable", "phase_b_variable"),
         transition=_coupled_phase,
     ),
     _ExecutorContract(
@@ -262,6 +322,8 @@ _EXECUTOR_CONTRACTS = (
         code_sha256=(
             "32a62827dc0f89e6eb14f4bc8f5112336239e0fec3301d3a3fd77cd9373b6409"
         ),
+        metadata_keys=_LINEAR_FEEDBACK_METADATA_KEYS,
+        output_variable_keys=("state_variable",),
         transition=_linear_feedback,
     ),
     _ExecutorContract(
@@ -270,6 +332,8 @@ _EXECUTOR_CONTRACTS = (
         code_sha256=(
             "d2f227a4ac4dbf519810562b1e3c6984acb1bf877b06dd63c2397ea73e0a631e"
         ),
+        metadata_keys=_NESTED_LINEAR_METADATA_KEYS,
+        output_variable_keys=("state_variable",),
         transition=_nested_linear,
     ),
 )
