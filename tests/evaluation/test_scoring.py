@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import ValidationError
 
+from pi_engine.evaluation import calibration as calibration_module
 from pi_engine.evaluation.calibration import (
     CalibrationSummary,
     CalibrationError,
@@ -117,6 +118,10 @@ def test_known_continuous_errors_are_reported_per_model_and_variable() -> None:
     report = score_revealed_evaluation(revealed, (prediction,))
 
     assert report.source == revealed
+    assert report.prediction_artifacts == (prediction,)
+    assert ForecastScoreReport.model_validate_json(
+        report.model_dump_json()
+    ) == report
     assert report.case_id == revealed.case_id
     assert report.case_sha256 == revealed.case_sha256
     assert report.binary_probability_variables == ()
@@ -671,6 +676,7 @@ def test_artifacts_bind_by_identity_instead_of_caller_position() -> None:
         first.trajectory_id,
         second.trajectory_id,
     }
+    assert report.prediction_artifacts == (first, second)
     assert tuple(item.reference for item in report.artifacts) == (
         *revealed.prediction_references,
     )
@@ -707,6 +713,23 @@ def test_report_rejects_duplicate_artifact_scores() -> None:
     )
 
     with pytest.raises(ValidationError, match="artifact identities.*unique"):
+        ForecastScoreReport.model_validate(payload)
+
+
+def test_report_rejects_duplicate_retained_prediction_artifacts() -> None:
+    """Each revealed reference needs one distinct retained raw artifact."""
+    first, second, revealed = _revealed_two_trajectories()
+    report = score_revealed_evaluation(revealed, (first, second))
+    payload = report.model_dump()
+    payload["prediction_artifacts"] = (
+        payload["prediction_artifacts"][0],
+        payload["prediction_artifacts"][0],
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="retained prediction artifact identities.*unique",
+    ):
         ForecastScoreReport.model_validate(payload)
 
 
@@ -860,24 +883,12 @@ def test_scaled_continuous_mean_keeps_three_large_squared_errors_finite() -> Non
 
 def test_scaled_interval_width_mean_avoids_sum_overflow() -> None:
     """Several finite wide intervals can still have a finite mean width."""
-    prediction, revealed = _revealed_ensemble()
-    report = score_revealed_evaluation(
-        revealed, (prediction,), interval_levels=(0.5,)
+    mean_width = calibration_module._stable_mean(
+        (1e308, 1e308, 1e308),
+        "interval width is not finite",
     )
-    payload = report.model_dump()
-    for interval in payload["artifacts"][0]["intervals"]:
-        interval.update(
-            {
-                "lower": -5e307,
-                "upper": 5e307,
-                "covered": True,
-            }
-        )
-    wide_report = ForecastScoreReport.model_validate(payload)
 
-    calibration = summarize_calibration(wide_report)
-
-    assert calibration.intervals[0].mean_interval_width == pytest.approx(1e308)
+    assert mean_width == pytest.approx(1e308)
 
 
 def test_huge_integer_outcome_is_wrapped_as_scoring_error() -> None:
@@ -986,3 +997,151 @@ def test_artifact_score_rejects_coordinated_type_reference_tampering() -> None:
         match="weight scheme and point estimate method",
     ):
         ArtifactScore.model_validate(payload)
+
+
+def test_report_rejects_coordinated_serialized_trajectory_type_mutation() -> None:
+    """Raw trajectory evidence must defeat a coherent ensemble-score forgery."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    payload = report.model_dump()
+    payload["source"]["prediction_references"][0]["artifact_type"] = (
+        "trajectory_ensemble"
+    )
+    payload["artifacts"][0].update(
+        {
+            "artifact_type": "trajectory_ensemble",
+            "weight_scheme": "unweighted",
+            "point_estimate_method": "equal_weight_raw_samples",
+        }
+    )
+    payload["artifacts"][0]["reference"]["artifact_type"] = (
+        "trajectory_ensemble"
+    )
+
+    with pytest.raises(ValidationError, match="prediction artifact type"):
+        ForecastScoreReport.model_validate(payload)
+
+
+def test_report_rejects_coordinated_serialized_ensemble_scheme_mutation() -> None:
+    """An unweighted retained ensemble cannot be relabeled probabilistic."""
+    prediction, revealed = _revealed_ensemble()
+    report = score_revealed_evaluation(revealed, (prediction,))
+    payload = report.model_dump()
+    payload["artifacts"][0].update(
+        {
+            "weight_scheme": "probability",
+            "point_estimate_method": "probability_weighted_raw_samples",
+        }
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="recompute from retained prediction artifact",
+    ):
+        ForecastScoreReport.model_validate(payload)
+
+
+def test_report_rejects_nested_coordinated_trajectory_type_mutation() -> None:
+    """Nested model_construct cannot bypass retained raw artifact typing."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    reference = report.source.prediction_references[0]
+    forged_reference = reference.model_copy(
+        update={"artifact_type": "trajectory_ensemble"}
+    )
+    forged_source = report.source.model_copy(
+        update={"prediction_references": (forged_reference,)}
+    )
+    score = report.artifacts[0]
+    score_fields = {
+        name: getattr(score, name) for name in type(score).model_fields
+    }
+    score_fields.update(
+        {
+            "artifact_type": "trajectory_ensemble",
+            "reference": forged_reference,
+            "weight_scheme": "unweighted",
+            "point_estimate_method": "equal_weight_raw_samples",
+        }
+    )
+    forged_score = ArtifactScore.model_construct(**score_fields)
+    report_fields = {
+        name: getattr(report, name) for name in type(report).model_fields
+    }
+    report_fields.update(
+        {"source": forged_source, "artifacts": (forged_score,)}
+    )
+    forged_report = ForecastScoreReport.model_construct(**report_fields)
+
+    with pytest.raises(ValidationError, match="prediction artifact type"):
+        ForecastScoreReport.model_validate(forged_report)
+
+
+def test_report_rejects_nested_coordinated_ensemble_scheme_mutation() -> None:
+    """Nested coherent metadata still must derive from the raw ensemble."""
+    prediction, revealed = _revealed_ensemble()
+    report = score_revealed_evaluation(revealed, (prediction,))
+    score = report.artifacts[0]
+    score_fields = {
+        name: getattr(score, name) for name in type(score).model_fields
+    }
+    score_fields.update(
+        {
+            "weight_scheme": "probability",
+            "point_estimate_method": "probability_weighted_raw_samples",
+        }
+    )
+    forged_score = ArtifactScore.model_construct(**score_fields)
+    report_fields = {
+        name: getattr(report, name) for name in type(report).model_fields
+    }
+    report_fields["artifacts"] = (forged_score,)
+    forged_report = ForecastScoreReport.model_construct(**report_fields)
+
+    with pytest.raises(
+        ValidationError,
+        match="recompute from retained prediction artifact",
+    ):
+        ForecastScoreReport.model_validate(forged_report)
+
+
+def test_report_rejects_serialized_retained_artifact_digest_mismatch() -> None:
+    """Forecast values retained by the report remain digest-bound."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    payload = report.model_dump()
+    payload["prediction_artifacts"] = [prediction.model_dump()]
+    payload["prediction_artifacts"][0]["points"][0]["values"]["x"] = 0.75
+
+    with pytest.raises(ValidationError, match="artifact SHA-256"):
+        ForecastScoreReport.model_validate(payload)
+
+
+def test_report_deeply_revalidates_nested_retained_artifact() -> None:
+    """Constructed invalid raw values cannot survive report revalidation."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    first_point = prediction.points[0]
+    point_fields = {
+        name: getattr(first_point, name)
+        for name in type(first_point).model_fields
+    }
+    point_fields["values"] = {"x": True}
+    forged_point = type(first_point).model_construct(**point_fields)
+    prediction_fields = {
+        name: getattr(prediction, name)
+        for name in type(prediction).model_fields
+    }
+    prediction_fields["points"] = (forged_point, *prediction.points[1:])
+    forged_prediction = type(prediction).model_construct(**prediction_fields)
+    report_fields = {
+        name: getattr(report, name) for name in type(report).model_fields
+    }
+    report_fields["prediction_artifacts"] = (forged_prediction,)
+    forged_report = ForecastScoreReport.model_construct(**report_fields)
+
+    with pytest.raises(
+        (ScoringError, ValidationError),
+        match="artifact must be a valid Trajectory",
+    ):
+        ForecastScoreReport.model_validate(forged_report)

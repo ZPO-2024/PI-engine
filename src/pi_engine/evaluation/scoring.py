@@ -214,8 +214,8 @@ class ArtifactScore(_ImmutableScoreSchema):
     """Scores remain separated by immutable prediction-artifact identity.
 
     Weight scheme and point-estimate method are structurally cross-validated.
-    Proving that an ensemble's declared scheme agrees with the digest-bound raw
-    artifact still requires artifact-assisted verification.
+    A standalone score still requires artifact-assisted verification;
+    ``ForecastScoreReport`` performs it using its retained prediction artifacts.
     """
 
     artifact_type: ArtifactType
@@ -321,12 +321,16 @@ class ArtifactScore(_ImmutableScoreSchema):
 class ForecastScoreReport(_ImmutableScoreSchema):
     """Self-consistent post-reveal scores with no combined ranking.
 
-    Retaining the revealed source detects detached or internally inconsistent
-    copies.  It is not an authenticity signature: adversarial storage or
-    transport still requires an external signature over the serialized report.
+    Retaining the revealed source and exact prediction artifacts permits full
+    score derivation checks.  This is not an authenticity signature: an attacker
+    able to rewrite the source, artifacts, and digests together must still be
+    countered by an external signature over the serialized report.
     """
 
     source: RevealedEvaluation
+    prediction_artifacts: Annotated[
+        tuple[PredictionArtifact, ...], Field(min_length=1)
+    ]
     case_id: NonEmptyString
     case_sha256: Sha256Hex
     binary_probability_variables: tuple[NonEmptyString, ...]
@@ -340,6 +344,15 @@ class ForecastScoreReport(_ImmutableScoreSchema):
         if isinstance(value, RevealedEvaluation):
             return RevealedEvaluation.model_validate(
                 value.model_dump(warnings=False)
+            )
+        return value
+
+    @field_validator("prediction_artifacts", mode="before")
+    @classmethod
+    def revalidate_prediction_artifacts(cls, value: object) -> object:
+        if isinstance(value, (tuple, list)):
+            return tuple(
+                _revalidate_retained_artifact(item) for item in value
             )
         return value
 
@@ -418,6 +431,31 @@ def _revalidate_artifact(value: object) -> PredictionArtifact:
         except (TypeError, ValueError, ValidationError) as exc:
             raise ScoringError("artifact must be a valid Trajectory") from exc
     raise TypeError("artifacts must contain Trajectory or TrajectoryEnsemble")
+
+
+def _revalidate_retained_artifact(value: object) -> PredictionArtifact:
+    if isinstance(value, (Trajectory, TrajectoryEnsemble)):
+        return _revalidate_artifact(value)
+    if not isinstance(value, dict):
+        raise TypeError(
+            "prediction_artifacts must contain Trajectory or "
+            "TrajectoryEnsemble records"
+        )
+    has_trajectory_id = "trajectory_id" in value
+    has_ensemble_id = "ensemble_id" in value
+    if has_trajectory_id == has_ensemble_id:
+        raise ScoringError(
+            "retained prediction artifact type cannot be determined"
+        )
+    model: type[Trajectory] | type[TrajectoryEnsemble] = (
+        Trajectory if has_trajectory_id else TrajectoryEnsemble
+    )
+    try:
+        return model.model_validate(value)
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise ScoringError(
+            f"artifact must be a valid {model.__name__}"
+        ) from exc
 
 
 def _artifact_identity(
@@ -562,6 +600,22 @@ def _validate_report_source(report: ForecastScoreReport) -> None:
     if set(artifact_keys) != set(reference_keys):
         raise ValueError("report artifacts must exactly match source references")
     references_by_key = dict(zip(reference_keys, references, strict=True))
+    scores_by_key = dict(zip(artifact_keys, report.artifacts, strict=True))
+
+    retained_keys = tuple(
+        _artifact_identity(item)[:2]
+        for item in report.prediction_artifacts
+    )
+    if len(set(retained_keys)) != len(retained_keys):
+        raise ValueError("retained prediction artifact identities must be unique")
+    if set(retained_keys) != set(reference_keys):
+        raise ValueError(
+            "retained prediction artifact type or identity must exactly match "
+            "source references"
+        )
+    retained_by_key = dict(
+        zip(retained_keys, report.prediction_artifacts, strict=True)
+    )
 
     outcomes_by_id = {item.outcome_id: item for item in report.source.outcomes}
     binary_variables = set(report.binary_probability_variables)
@@ -658,6 +712,30 @@ def _validate_report_source(report: ForecastScoreReport) -> None:
                 or interval.observed != expected_observed
             ):
                 raise ValueError("interval score does not match source outcome")
+
+    for reference in references:
+        key = _reference_key(reference)
+        retained_artifact = retained_by_key[key]
+        try:
+            digest = _bind_artifact(
+                retained_artifact, reference, report.source
+            )
+            expected_score = _score_artifact(
+                report.source,
+                retained_artifact,
+                reference,
+                digest,
+                report.binary_probability_variables,
+                report.include_log_score,
+                report.interval_levels,
+            )
+        except ScoringError as exc:
+            raise ValueError(str(exc)) from exc
+        if scores_by_key[key] != expected_score:
+            raise ValueError(
+                "artifact score must exactly recompute from retained "
+                "prediction artifact"
+            )
 
 
 def _trajectories(
@@ -1058,6 +1136,9 @@ def score_revealed_evaluation(
     )
     return ForecastScoreReport(
         source=validated_revealed,
+        prediction_artifacts=tuple(
+            artifact for artifact, _, _ in bound
+        ),
         case_id=validated_revealed.case_id,
         case_sha256=validated_revealed.case_sha256,
         binary_probability_variables=binary_variables,
