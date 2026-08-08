@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 from fractions import Fraction
+import hashlib
+import json
 import math
 from typing import Annotated, Literal
 
@@ -12,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     ValidationError,
     field_validator,
@@ -25,7 +28,11 @@ from pi_engine.analysis._shared import (
 )
 from pi_engine.analysis.divergence import SpreadAnalysis, SpreadPoint
 from pi_engine.schemas.common import FiniteFloat, Provenance
-from pi_engine.schemas.trajectory import Trajectory, TrajectoryEnsemble
+from pi_engine.schemas.trajectory import (
+    ConstraintActivation,
+    Trajectory,
+    TrajectoryEnsemble,
+)
 
 
 NonEmptyString = Annotated[str, Field(min_length=1)]
@@ -124,10 +131,16 @@ class KnownHardConstraintEvidence(_ImmutableClosureSchema):
     effective_at: datetime
     variable: NonEmptyString
     component: ComponentName
+    modeled_domain: NonEmptyString
+    structurally_hard: StrictBool
+    irreversible_within_horizon: StrictBool
+    hardness_basis: NonEmptyString
+    source_activation_available_at: datetime
+    source_activation_provenance: Provenance
     description: NonEmptyString
     provenance: Provenance
 
-    @field_validator("effective_at")
+    @field_validator("effective_at", "source_activation_available_at")
     @classmethod
     def effective_time_must_be_aware(cls, value: datetime) -> datetime:
         return _require_timezone(value, "hard constraint effective_at")
@@ -137,12 +150,32 @@ class KnownHardConstraintEvidence(_ImmutableClosureSchema):
     def revalidate_provenance(cls, value: object) -> object:
         return _revalidate_provenance(value)
 
+    @field_validator("source_activation_provenance", mode="before")
+    @classmethod
+    def revalidate_source_activation_provenance(
+        cls, value: object
+    ) -> object:
+        return _revalidate_provenance(value)
+
     @model_validator(mode="after")
     def provenance_must_have_audit_identity(
         self,
     ) -> KnownHardConstraintEvidence:
         if self.provenance.reference is None or not self.provenance.reference:
             raise ValueError("closure evidence provenance requires a reference")
+        if (
+            self.source_activation_provenance.reference is None
+            or not self.source_activation_provenance.reference
+        ):
+            raise ValueError(
+                "hard evidence source activation provenance requires a reference"
+            )
+        if _utc(self.source_activation_available_at) < _utc(
+            self.source_activation_provenance.observed_at
+        ):
+            raise ValueError(
+                "source activation availability cannot precede its provenance"
+            )
         return self
 
 
@@ -412,6 +445,9 @@ class ClosureAnalysis(_ImmutableClosureSchema):
     @model_validator(mode="after")
     def validate_source_bound_recomputation(self) -> ClosureAnalysis:
         _validate_evidence_alignment(self.source, self.configuration)
+        event_ids = tuple(event.event_id for event in self.events)
+        if len(set(event_ids)) != len(event_ids):
+            raise ValueError("closure event identities must be unique")
         expected = _derive_events(self.source, self.configuration)
         if canonical_record_content(self.events) != canonical_record_content(
             expected
@@ -485,14 +521,19 @@ def _configuration_from_inputs(
         ) from exc
 
 
-def _source_constraints(source: SpreadAnalysis) -> tuple[str, ...]:
+def _source_member(source: SpreadAnalysis) -> Trajectory:
     raw = source.source
-    member = (
+    return (
         raw.trajectories[0]
         if isinstance(raw, TrajectoryEnsemble)
         else raw
     )
-    return member.constraints_encountered
+
+
+def _source_activations(
+    source: SpreadAnalysis,
+) -> tuple[ConstraintActivation, ...]:
+    return _source_member(source).constraint_activations
 
 
 def _points_by_scope(
@@ -516,10 +557,7 @@ def _validate_evidence_alignment(
     configuration: ClosureConfiguration,
 ) -> None:
     points_by_scope = _points_by_scope(source)
-    for evidence in (
-        *configuration.information_updates,
-        *configuration.hard_constraints,
-    ):
+    for evidence in configuration.information_updates:
         scope = (evidence.variable, evidence.component)
         if scope not in points_by_scope:
             raise ClosureAnalysisError(
@@ -579,6 +617,30 @@ def _reachable_set_proxy(point: SpreadPoint) -> ClosureProxyMagnitude:
     if magnitude.value is None:
         raise ClosureAnalysisError("finite spread range lacks a retained value")
     return _positive_magnitude(magnitude.value)
+
+
+def _support_width_strictly_contracts(
+    before: SpreadPoint,
+    after: SpreadPoint,
+) -> bool:
+    """Return true only when retained support widths prove strict contraction."""
+    before_range = before.spread_range
+    after_range = after.spread_range
+    if after_range.kind == "above_float_range":
+        return False
+    if before_range.kind == "above_float_range":
+        return True
+    if before_range.kind == "below_float_resolution":
+        return (
+            after_range.kind == "finite" and after_range.value == 0.0
+        )
+    if before_range.value is None:
+        raise ClosureAnalysisError("finite before support width lacks a value")
+    if after_range.kind == "below_float_resolution":
+        return before_range.value > 0.0
+    if after_range.value is None:
+        raise ClosureAnalysisError("finite after support width lacks a value")
+    return after_range.value < before_range.value
 
 
 def _proxy_snapshot(point: SpreadPoint) -> ClosureProxySnapshot:
@@ -646,22 +708,88 @@ def _matching_evidence(
     tuple[InformationUpdateEvidence, ...],
     tuple[KnownHardConstraintEvidence, ...],
 ]:
-    del before
     scope = (after.variable, after.component)
-    effective_key = _utc(after.at, ClosureAnalysisError)
+    before_key = _utc(before.at, ClosureAnalysisError)
+    after_key = _utc(after.at, ClosureAnalysisError)
     information = tuple(
         item
         for item in configuration.information_updates
         if (item.variable, item.component) == scope
-        and _utc(item.effective_at, ClosureAnalysisError) == effective_key
+        and _utc(item.effective_at, ClosureAnalysisError) == after_key
     )
     hard = tuple(
         item
         for item in configuration.hard_constraints
         if (item.variable, item.component) == scope
-        and _utc(item.effective_at, ClosureAnalysisError) == effective_key
+        and before_key
+        < _utc(item.effective_at, ClosureAnalysisError)
+        <= after_key
     )
     return information, hard
+
+
+def _activation_matches_evidence(
+    activation: ConstraintActivation,
+    evidence: KnownHardConstraintEvidence,
+) -> bool:
+    return (
+        activation.constraint_id == evidence.constraint_id
+        and _utc(activation.activated_at, ClosureAnalysisError)
+        == _utc(evidence.effective_at, ClosureAnalysisError)
+        and activation.variable == evidence.variable
+        and activation.component == evidence.component
+        and activation.modeled_domain == evidence.modeled_domain
+        and activation.structurally_hard == evidence.structurally_hard
+        and activation.irreversible_within_horizon
+        == evidence.irreversible_within_horizon
+        and activation.hardness_basis == evidence.hardness_basis
+        and _utc(activation.available_at, ClosureAnalysisError)
+        == _utc(
+            evidence.source_activation_available_at,
+            ClosureAnalysisError,
+        )
+        and canonical_model_content(activation.provenance)
+        == canonical_model_content(evidence.source_activation_provenance)
+    )
+
+
+def _hard_evidence_is_source_bound_and_contemporaneous(
+    source: SpreadAnalysis,
+    before: SpreadPoint,
+    after: SpreadPoint,
+    evidence: KnownHardConstraintEvidence,
+) -> bool:
+    before_key = _utc(before.at, ClosureAnalysisError)
+    after_key = _utc(after.at, ClosureAnalysisError)
+    matches = tuple(
+        activation
+        for activation in _source_activations(source)
+        if before_key
+        < _utc(activation.activated_at, ClosureAnalysisError)
+        <= after_key
+        and _activation_matches_evidence(activation, evidence)
+    )
+    if len(matches) != 1:
+        return False
+    activation = matches[0]
+    if not (
+        activation.structurally_hard
+        and activation.irreversible_within_horizon
+        and evidence.structurally_hard
+        and evidence.irreversible_within_horizon
+    ):
+        return False
+    available_times = (
+        activation.provenance.observed_at,
+        activation.available_at,
+        evidence.source_activation_provenance.observed_at,
+        evidence.source_activation_available_at,
+        evidence.provenance.observed_at,
+    )
+    return all(
+        _utc(item, ClosureAnalysisError) <= after_key
+        for item in available_times
+    )
 
 
 def _classify_context(
@@ -676,11 +804,22 @@ def _classify_context(
     )
     if not information and not hard:
         return "unknown", "unknown", "absent", ()
-    constraints = _source_constraints(source)
-    hard_is_consistent = bool(hard) and all(
-        constraints.count(item.constraint_id) == 1 for item in hard
+    hard_is_consistent = (
+        bool(hard)
+        and _support_width_strictly_contracts(before, after)
+        and all(
+            _hard_evidence_is_source_bound_and_contemporaneous(
+                source, before, after, item
+            )
+            for item in hard
+        )
     )
-    if information and not hard:
+    information_is_contemporaneous = bool(information) and all(
+        _utc(item.provenance.observed_at, ClosureAnalysisError)
+        <= _utc(after.at, ClosureAnalysisError)
+        for item in information
+    )
+    if information and not hard and information_is_contemporaneous:
         return (
             "epistemic",
             "provisional",
@@ -703,16 +842,59 @@ def _classify_context(
 
 
 def _event_id(
+    source: SpreadAnalysis,
     variable: str,
     component: str | None,
     before_index: int,
+    before: SpreadPoint,
     after: SpreadPoint,
 ) -> str:
-    component_identity = component if component is not None else "scalar"
-    return (
-        f"closure:{variable}:{component_identity}:{before_index}:"
-        f"{before_index + 1}:{_utc(after.at, ClosureAnalysisError)}"
-    )
+    raw = source.source
+    source_identity: dict[str, object]
+    if isinstance(raw, TrajectoryEnsemble):
+        source_identity = {
+            "kind": "trajectory_ensemble",
+            "ensemble_id": raw.ensemble_id,
+            "model_id": raw.model_id,
+            "model_version": raw.model_version,
+            "case_id": raw.case_id,
+        }
+    else:
+        source_identity = {
+            "kind": "trajectory",
+            "trajectory_id": raw.trajectory_id,
+            "model_id": raw.model_id,
+            "model_version": raw.model_version,
+            "case_id": raw.case_id,
+        }
+    payload = {
+        "domain": "pi_engine.closure_event.v1",
+        "source": source_identity,
+        "scope": {"variable": variable, "component": component},
+        "transition": {
+            "before_point_index": before_index,
+            "after_point_index": before_index + 1,
+            "from_at": canonical_model_content(before)["at"],
+            "to_at": canonical_model_content(after)["at"],
+            "from_utc_instant_key": str(
+                _utc(before.at, ClosureAnalysisError)
+            ),
+            "to_utc_instant_key": str(
+                _utc(after.at, ClosureAnalysisError)
+            ),
+        },
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256(
+        b"pi_engine.closure_event.v1\x00" + canonical
+    ).hexdigest()
+    return f"closure-sha256:{digest}"
 
 
 def _derive_events(
@@ -743,7 +925,12 @@ def _derive_events(
             events.append(
                 ClosureEvent(
                     event_id=_event_id(
-                        scope[0], scope[1], before_index, after
+                        source,
+                        scope[0],
+                        scope[1],
+                        before_index,
+                        before,
+                        after,
                     ),
                     variable=scope[0],
                     component=scope[1],

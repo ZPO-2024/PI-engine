@@ -10,6 +10,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     field_serializer,
     field_validator,
@@ -111,6 +112,50 @@ class ScenarioWeight(_ImmutablePredictionSchema):
         return self
 
 
+class ConstraintActivation(_ImmutablePredictionSchema):
+    """One source-retained constraint activation with exact audit scope."""
+
+    constraint_id: NonEmptyString
+    activated_at: datetime
+    variable: NonEmptyString
+    component: NonEmptyString | None
+    modeled_domain: NonEmptyString
+    structurally_hard: StrictBool
+    irreversible_within_horizon: StrictBool
+    hardness_basis: NonEmptyString
+    available_at: datetime
+    provenance: Provenance
+
+    @field_validator("activated_at", "available_at")
+    @classmethod
+    def times_must_be_timezone_aware(
+        cls, value: datetime, info: object
+    ) -> datetime:
+        return _require_timezone(
+            value, getattr(info, "field_name", "constraint activation time")
+        )
+
+    @field_validator("provenance", mode="before")
+    @classmethod
+    def revalidate_provenance(cls, value: object) -> object:
+        if isinstance(value, Provenance):
+            return Provenance.model_validate(value.model_dump())
+        return value
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> "ConstraintActivation":
+        if self.provenance.reference is None or not self.provenance.reference:
+            raise ValueError("constraint activation provenance requires a reference")
+        if utc_instant_key(self.available_at) < utc_instant_key(
+            self.provenance.observed_at
+        ):
+            raise ValueError(
+                "constraint activation available_at cannot precede provenance "
+                "observed_at"
+            )
+        return self
+
+
 class Trajectory(_ImmutablePredictionSchema):
     """One explicit model-conditioned deterministic or stochastic scenario."""
 
@@ -132,6 +177,10 @@ class Trajectory(_ImmutablePredictionSchema):
     points: Annotated[tuple[TrajectoryPoint, ...], Field(min_length=1)]
     scenario_weight: ScenarioWeight | None = None
     constraints_encountered: tuple[NonEmptyString, ...]
+    constraint_activations: tuple[ConstraintActivation, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
     provenance: Provenance
 
     @field_validator("initial_state", mode="before")
@@ -167,6 +216,18 @@ class Trajectory(_ImmutablePredictionSchema):
             return ScenarioWeight.model_validate(value.model_dump())
         return value
 
+    @field_validator("constraint_activations", mode="before")
+    @classmethod
+    def revalidate_constraint_activations(cls, value: object) -> object:
+        if isinstance(value, (tuple, list)):
+            return tuple(
+                ConstraintActivation.model_validate(item.model_dump())
+                if isinstance(item, ConstraintActivation)
+                else item
+                for item in value
+            )
+        return value
+
     @field_validator("provenance", mode="before")
     @classmethod
     def revalidate_provenance(cls, value: object) -> object:
@@ -189,6 +250,30 @@ class Trajectory(_ImmutablePredictionSchema):
             if previous_key is not None and point_key <= previous_key:
                 raise ValueError("trajectory points must be strictly ordered")
             previous_key = point_key
+
+        activation_keys: list[tuple[object, ...]] = []
+        for activation in self.constraint_activations:
+            activated_key = utc_instant_key(activation.activated_at)
+            if not start_key <= activated_key <= end_key:
+                raise ValueError(
+                    "constraint activation must occur within the trajectory horizon"
+                )
+            if self.constraints_encountered.count(activation.constraint_id) != 1:
+                raise ValueError(
+                    "constraint activation id must occur exactly once in "
+                    "constraints_encountered"
+                )
+            activation_keys.append(
+                (
+                    activation.constraint_id,
+                    activated_key,
+                    activation.variable,
+                    activation.component,
+                    activation.modeled_domain,
+                )
+            )
+        if len(set(activation_keys)) != len(activation_keys):
+            raise ValueError("constraint activations must be unique")
         return self
 
 
@@ -395,6 +480,10 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
         expected_initial_state = self.trajectories[0].initial_state
         expected_horizon = self.trajectories[0].horizon
         expected_constraints = self.trajectories[0].constraints_encountered
+        expected_activations = tuple(
+            item.model_dump(mode="json")
+            for item in self.trajectories[0].constraint_activations
+        )
         trajectory_ids = {
             trajectory.trajectory_id for trajectory in self.trajectories
         }
@@ -448,6 +537,14 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
             if trajectory.constraints_encountered != expected_constraints:
                 raise ValueError(
                     "trajectory ensemble members must share encountered constraints"
+                )
+            actual_activations = tuple(
+                item.model_dump(mode="json")
+                for item in trajectory.constraint_activations
+            )
+            if actual_activations != expected_activations:
+                raise ValueError(
+                    "trajectory ensemble members must share constraint activations"
                 )
 
         weights = [trajectory.scenario_weight for trajectory in self.trajectories]

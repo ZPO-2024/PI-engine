@@ -13,6 +13,7 @@ from pi_engine.schemas.residual import (
 )
 from pi_engine.schemas.state import StateEstimate
 from pi_engine.schemas.trajectory import (
+    ConstraintActivation,
     ScenarioWeight,
     Trajectory,
     TrajectoryEnsemble,
@@ -62,6 +63,28 @@ def trajectory_payload(**overrides: object) -> dict[str, object]:
     }
     values.update(overrides)
     return values
+
+
+def constraint_activation(**overrides: object) -> ConstraintActivation:
+    activated_at = START + timedelta(hours=2)
+    values: dict[str, object] = {
+        "constraint_id": "flow >= 0",
+        "activated_at": activated_at,
+        "variable": "flow",
+        "component": None,
+        "modeled_domain": "modeled river channel",
+        "structurally_hard": True,
+        "irreversible_within_horizon": True,
+        "hardness_basis": "The modeled lower boundary cannot be crossed.",
+        "available_at": activated_at,
+        "provenance": Provenance(
+            source="Task 12 retained constraint monitor",
+            observed_at=activated_at,
+            reference="constraint-activation:flow-lower-bound",
+        ),
+    }
+    values.update(overrides)
+    return ConstraintActivation.model_validate(values)
 
 
 def outcome_payload(**overrides: object) -> dict[str, object]:
@@ -155,6 +178,164 @@ def test_trajectory_supports_unweighted_deterministic_scenario() -> None:
     )
 
     assert trajectory.scenario_weight is None
+
+
+def test_legacy_trajectory_defaults_to_no_constraint_activations() -> None:
+    """Existing simulation records remain valid without invented activations."""
+    trajectory = Trajectory.model_validate(trajectory_payload())
+
+    assert trajectory.constraint_activations == ()
+    assert "constraint_activations" not in trajectory.model_dump(mode="json")
+
+
+def test_trajectory_retains_structured_constraint_activation_and_round_trips() -> None:
+    """A hard-closure source must retain scope, domain, basis, time, and availability."""
+    activation = constraint_activation()
+    trajectory = Trajectory.model_validate(
+        trajectory_payload(constraint_activations=(activation,))
+    )
+
+    assert trajectory.constraint_activations == (activation,)
+    assert Trajectory.model_validate_json(trajectory.model_dump_json()) == trajectory
+    with pytest.raises(ValidationError, match="frozen"):
+        activation.constraint_id = "changed"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("activated_at", datetime(2026, 8, 8, 14), "timezone"),
+        ("available_at", datetime(2026, 8, 8, 14), "timezone"),
+        ("constraint_id", "", "at least 1 character"),
+        ("modeled_domain", "", "at least 1 character"),
+        ("hardness_basis", "", "at least 1 character"),
+    ],
+)
+def test_constraint_activation_requires_complete_typed_identity(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    """Missing activation identity would make a later closure join ambiguous."""
+    payload = constraint_activation().model_dump(warnings=False)
+    payload[field] = value
+
+    with pytest.raises(ValidationError, match=message):
+        ConstraintActivation.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("activation", "constraints", "message"),
+    [
+        (
+            lambda: constraint_activation(activated_at=END + timedelta(hours=1)),
+            ("flow >= 0",),
+            "within the trajectory horizon",
+        ),
+        (
+            lambda: constraint_activation(constraint_id="unknown-boundary"),
+            ("flow >= 0",),
+            "exactly once in constraints_encountered",
+        ),
+    ],
+    ids=("outside-horizon", "missing-encounter-link"),
+)
+def test_trajectory_binds_activation_to_horizon_and_encountered_constraint(
+    activation: object,
+    constraints: tuple[str, ...],
+    message: str,
+) -> None:
+    """A detached activation cannot support source-bound hard closure."""
+    with pytest.raises(ValidationError, match=message):
+        Trajectory.model_validate(
+            trajectory_payload(
+                constraints_encountered=constraints,
+                constraint_activations=(activation(),),  # type: ignore[operator]
+            )
+        )
+
+
+def test_trajectory_rejects_duplicate_constraint_activation_identity() -> None:
+    """Duplicate activation facts cannot count as a unique hard constraint."""
+    activation = constraint_activation()
+
+    with pytest.raises(ValidationError, match="activations must be unique"):
+        Trajectory.model_validate(
+            trajectory_payload(constraint_activations=(activation, activation))
+        )
+
+
+def test_constraint_activation_rejects_availability_before_source_observation() -> None:
+    """Availability cannot precede the retained provenance observation."""
+    observed_at = START + timedelta(hours=3)
+
+    with pytest.raises(ValidationError, match="available_at.*provenance"):
+        constraint_activation(
+            available_at=START + timedelta(hours=2),
+            provenance=Provenance(
+                source="late source",
+                observed_at=observed_at,
+                reference="late-source:activation",
+            ),
+        )
+
+
+def test_trajectory_deeply_revalidates_constructed_constraint_activation() -> None:
+    """Trusted construction cannot inject an empty activation identity."""
+    invalid = ConstraintActivation.model_construct(
+        **{
+            **constraint_activation().__dict__,
+            "constraint_id": "",
+        }
+    )
+
+    with pytest.raises(ValidationError, match="at least 1 character"):
+        Trajectory.model_validate(
+            trajectory_payload(constraint_activations=(invalid,))
+        )
+
+
+def test_serialized_activation_tamper_breaks_exact_encounter_link() -> None:
+    """Editing serialized activation identity must invalidate its trajectory link."""
+    trajectory = Trajectory.model_validate(
+        trajectory_payload(constraint_activations=(constraint_activation(),))
+    )
+    payload = trajectory.model_dump(warnings=False)
+    payload["constraint_activations"][0]["constraint_id"] = "edited-boundary"
+
+    with pytest.raises(ValidationError, match="exactly once"):
+        Trajectory.model_validate(payload)
+
+
+def test_ensemble_members_must_share_system_wide_constraint_activations() -> None:
+    """Member-specific activation metadata cannot establish a system-wide fact."""
+    activation = constraint_activation()
+    first = Trajectory.model_validate(
+        trajectory_payload(
+            trajectory_id="activation-member-1",
+            scenario_weight=None,
+            constraint_activations=(activation,),
+        )
+    )
+    second = Trajectory.model_validate(
+        trajectory_payload(
+            trajectory_id="activation-member-2",
+            scenario_weight=None,
+            constraint_activations=(
+                activation.model_copy(update={"modeled_domain": "floodplain"}),
+            ),
+        )
+    )
+
+    with pytest.raises(ValidationError, match="constraint activations"):
+        TrajectoryEnsemble(
+            ensemble_id="activation-coherence",
+            model_id=first.model_id,
+            model_version=first.model_version,
+            case_id=first.case_id,
+            trajectories=(first, second),
+            provenance=provenance("activation coherence test"),
+        )
 
 
 @pytest.mark.parametrize(
