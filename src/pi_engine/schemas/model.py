@@ -151,6 +151,20 @@ class ExplicitModel(_ImmutableSchema):
     expected_regimes: tuple[NonEmptyString, ...]
     falsification: FalsificationSpec
 
+    @field_validator("provenance", mode="before")
+    @classmethod
+    def revalidate_provenance_instance(cls, value: object) -> object:
+        if isinstance(value, Provenance):
+            return Provenance.model_validate(value.model_dump())
+        return value
+
+    @field_validator("initial_confidence", mode="before")
+    @classmethod
+    def revalidate_confidence_instance(cls, value: object) -> object:
+        if isinstance(value, Confidence):
+            return Confidence.model_validate(value.model_dump())
+        return value
+
 
 class ModelPerformance(_ImmutableSchema):
     """Immutable evaluation evidence for one model ID/version as of a time."""
@@ -165,6 +179,13 @@ class ModelPerformance(_ImmutableSchema):
     known_failure_regimes: tuple[NonEmptyString, ...]
     evidence: tuple[NonEmptyString, ...]
     provenance: Provenance
+
+    @field_validator("provenance", mode="before")
+    @classmethod
+    def revalidate_provenance_instance(cls, value: object) -> object:
+        if isinstance(value, Provenance):
+            return Provenance.model_validate(value.model_dump())
+        return value
 
     @field_validator("as_of")
     @classmethod

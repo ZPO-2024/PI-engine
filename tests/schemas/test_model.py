@@ -227,6 +227,36 @@ def test_explicit_model_nested_containers_are_immutable() -> None:
         model.version = "2.0.0"
 
 
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        Provenance.model_construct(source="", observed_at=AS_OF),
+        Provenance.model_construct(
+            source="Hydrology model catalog",
+            observed_at=datetime(2026, 8, 8, 15, 0),
+        ),
+    ],
+)
+def test_explicit_model_revalidates_preconstructed_provenance(
+    provenance: Provenance,
+) -> None:
+    """Trusted model instances must not bypass source and timezone validation."""
+    payload = model_payload()
+    payload["provenance"] = provenance
+
+    with pytest.raises(ValidationError):
+        ExplicitModel.model_validate(payload)
+
+
+def test_explicit_model_revalidates_preconstructed_confidence() -> None:
+    """A preconstructed confidence object must not bypass probability bounds."""
+    payload = model_payload()
+    payload["initial_confidence"] = Confidence.model_construct(score=2.0)
+
+    with pytest.raises(ValidationError, match="initial_confidence"):
+        ExplicitModel.model_validate(payload)
+
+
 @pytest.mark.parametrize("status", [ModelStatus.DEGRADED, ModelStatus.REJECTED])
 def test_nonusable_model_performance_remains_serializable_and_auditable(
     status: ModelStatus,
@@ -315,6 +345,25 @@ def test_model_performance_rejects_naive_as_of_time() -> None:
             known_failure_regimes=(),
             evidence=(),
             provenance=values["provenance"],
+        )
+
+
+def test_model_performance_revalidates_preconstructed_provenance() -> None:
+    """An as-of record must not accept provenance that bypassed shared validation."""
+    invalid_provenance = Provenance.model_construct(source="", observed_at=AS_OF)
+
+    with pytest.raises(ValidationError, match="provenance"):
+        ModelPerformance(
+            model_id="river-linear-decay",
+            model_version="1.2.0",
+            as_of=AS_OF,
+            status=ModelStatus.EXPERIMENTAL,
+            cases_tested=(),
+            calibration_metrics={},
+            prediction_errors={},
+            known_failure_regimes=(),
+            evidence=(),
+            provenance=invalid_provenance,
         )
 
 
