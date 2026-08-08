@@ -33,6 +33,12 @@ from pi_engine.schemas.trajectory import Trajectory, TrajectoryEnsemble
 NonEmptyString = Annotated[str, Field(min_length=1)]
 Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 ArtifactType = Literal["trajectory", "trajectory_ensemble"]
+WeightScheme = Literal[
+    "not_applicable",
+    "unweighted",
+    "probability",
+    "relative_weight",
+]
 PredictionArtifact = Trajectory | TrajectoryEnsemble
 
 
@@ -205,7 +211,12 @@ class IntervalPointScore(_ImmutableScoreSchema):
 
 
 class ArtifactScore(_ImmutableScoreSchema):
-    """Scores remain separated by immutable prediction-artifact identity."""
+    """Scores remain separated by immutable prediction-artifact identity.
+
+    Weight scheme and point-estimate method are structurally cross-validated.
+    Proving that an ensemble's declared scheme agrees with the digest-bound raw
+    artifact still requires artifact-assisted verification.
+    """
 
     artifact_type: ArtifactType
     artifact_id: NonEmptyString
@@ -213,6 +224,7 @@ class ArtifactScore(_ImmutableScoreSchema):
     model_id: NonEmptyString
     model_version: NonEmptyString
     reference: PredictionReference
+    weight_scheme: WeightScheme
     point_estimate_method: Literal[
         "trajectory_value",
         "equal_weight_raw_samples",
@@ -274,6 +286,27 @@ class ArtifactScore(_ImmutableScoreSchema):
             or self.model_version != self.reference.model_version
         ):
             raise ValueError("artifact score identity does not match reference")
+        valid_weight_methods: dict[
+            tuple[ArtifactType, WeightScheme], str
+        ] = {
+            ("trajectory", "not_applicable"): "trajectory_value",
+            ("trajectory_ensemble", "unweighted"): (
+                "equal_weight_raw_samples"
+            ),
+            ("trajectory_ensemble", "probability"): (
+                "probability_weighted_raw_samples"
+            ),
+            ("trajectory_ensemble", "relative_weight"): (
+                "normalized_relative_weight_raw_samples"
+            ),
+        }
+        expected_method = valid_weight_methods.get(
+            (self.artifact_type, self.weight_scheme)
+        )
+        if expected_method != self.point_estimate_method:
+            raise ValueError(
+                "weight scheme and point estimate method must match artifact type"
+            )
         if self.continuous_metrics != _continuous_metrics(
             self.continuous_points
         ):
@@ -637,14 +670,18 @@ def _trajectories(
 
 def _weights_and_method(
     artifact: PredictionArtifact,
-) -> tuple[tuple[float, ...], str]:
+) -> tuple[tuple[float, ...], str, WeightScheme]:
     trajectories = _trajectories(artifact)
     if isinstance(artifact, Trajectory):
-        return (1.0,), "trajectory_value"
+        return (1.0,), "trajectory_value", "not_applicable"
     declared = tuple(item.scenario_weight for item in trajectories)
     if all(item is None for item in declared):
         count = len(trajectories)
-        return tuple(1.0 / count for _ in trajectories), "equal_weight_raw_samples"
+        return (
+            tuple(1.0 / count for _ in trajectories),
+            "equal_weight_raw_samples",
+            "unweighted",
+        )
     weights = tuple(item for item in declared if item is not None)
     raw = tuple(item.value for item in weights)
     scale = max(raw)
@@ -659,8 +696,12 @@ def _weights_and_method(
     if not all(math.isfinite(item) and item >= 0.0 for item in normalized):
         raise ScoringError("scenario weights cannot be normalized finitely")
     if weights[0].kind == "probability":
-        return normalized, "probability_weighted_raw_samples"
-    return normalized, "normalized_relative_weight_raw_samples"
+        return normalized, "probability_weighted_raw_samples", "probability"
+    return (
+        normalized,
+        "normalized_relative_weight_raw_samples",
+        "relative_weight",
+    )
 
 
 def _aligned_values(
@@ -834,7 +875,7 @@ def _score_artifact(
     include_log_score: bool,
     interval_levels: tuple[float, ...],
 ) -> ArtifactScore:
-    weights, point_method = _weights_and_method(artifact)
+    weights, point_method, weight_scheme = _weights_and_method(artifact)
     continuous: list[ContinuousPointScore] = []
     probabilities: list[ProbabilityPointScore] = []
     intervals: list[IntervalPointScore] = []
@@ -920,6 +961,7 @@ def _score_artifact(
         model_id=artifact.model_id,
         model_version=artifact.model_version,
         reference=reference,
+        weight_scheme=weight_scheme,
         point_estimate_method=point_method,
         continuous_points=tuple(continuous),
         continuous_metrics=_continuous_metrics(tuple(continuous)),

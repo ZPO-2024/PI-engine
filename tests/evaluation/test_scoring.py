@@ -133,6 +133,7 @@ def test_known_continuous_errors_are_reported_per_model_and_variable() -> None:
         prediction.model_id,
         prediction.model_version,
     )
+    assert artifact.weight_scheme == "not_applicable"
     assert artifact.point_estimate_method == "trajectory_value"
     assert [item.variable for item in artifact.continuous_points] == [
         "x",
@@ -265,6 +266,7 @@ def test_empirical_intervals_and_calibration_use_raw_ensemble_samples() -> None:
     )
 
     artifact = report.artifacts[0]
+    assert artifact.weight_scheme == "unweighted"
     assert artifact.point_estimate_method == "equal_weight_raw_samples"
     assert [item.forecast for item in artifact.continuous_points] == [
         0.5,
@@ -829,6 +831,7 @@ def test_max_float_relative_weights_normalize_without_overflow() -> None:
     report = score_revealed_evaluation(weighted_reveal, (weighted,))
 
     artifact = report.artifacts[0]
+    assert artifact.weight_scheme == "relative_weight"
     assert artifact.point_estimate_method == (
         "normalized_relative_weight_raw_samples"
     )
@@ -885,3 +888,101 @@ def test_huge_integer_outcome_is_wrapped_as_scoring_error() -> None:
 
     with pytest.raises(ScoringError, match="outcome.*representable"):
         score_revealed_evaluation(revealed, (prediction,))
+
+
+def test_probability_weight_scheme_is_derived_from_revalidated_ensemble() -> None:
+    """Probability-member weights must remain distinct from relative weights."""
+    prediction, _ = _revealed_ensemble()
+    weight = ScenarioWeight(
+        kind="probability",
+        value=0.25,
+        justification="four equiprobable retained scenarios",
+    )
+    trajectories = tuple(
+        item.model_copy(update={"scenario_weight": weight})
+        for item in prediction.trajectories
+    )
+    weighted = prediction.model_copy(update={"trajectories": trajectories})
+    fixture = stochastic_branching(seed=7)
+    prepared = prepare_holdout(fixture.case, fixture.outcomes)
+    revealed = reveal_holdout(prepared, weighted)
+
+    report = score_revealed_evaluation(revealed, (weighted,))
+
+    artifact = report.artifacts[0]
+    assert artifact.weight_scheme == "probability"
+    assert artifact.point_estimate_method == "probability_weighted_raw_samples"
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"point_estimate_method": "equal_weight_raw_samples"},
+        {"weight_scheme": "relative_weight"},
+    ],
+    ids=("method", "scheme"),
+)
+def test_report_rejects_serialized_weight_metadata_tampering(
+    update: dict[str, str],
+) -> None:
+    """A copied trajectory score cannot claim an ensemble weighting method."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    payload = report.model_dump()
+    payload["artifacts"][0].update(update)
+
+    with pytest.raises(
+        ValidationError,
+        match="weight scheme and point estimate method",
+    ):
+        ForecastScoreReport.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"point_estimate_method": "equal_weight_raw_samples"},
+        {"weight_scheme": "relative_weight"},
+    ],
+    ids=("method", "scheme"),
+)
+def test_report_revalidates_constructed_weight_metadata(
+    update: dict[str, str],
+) -> None:
+    """Nested model_construct cannot bypass the weight-method mapping."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    artifact = report.artifacts[0]
+    artifact_fields = {
+        name: getattr(artifact, name)
+        for name in type(artifact).model_fields
+    }
+    artifact_fields.update(update)
+    forged_artifact = ArtifactScore.model_construct(**artifact_fields)
+    report_fields = {
+        name: getattr(report, name) for name in type(report).model_fields
+    }
+    report_fields["artifacts"] = (forged_artifact,)
+    forged_report = ForecastScoreReport.model_construct(**report_fields)
+
+    with pytest.raises(
+        ValidationError,
+        match="weight scheme and point estimate method",
+    ):
+        ForecastScoreReport.model_validate(forged_report)
+
+
+def test_artifact_score_rejects_coordinated_type_reference_tampering() -> None:
+    """Changing both type fields cannot legitimize a trajectory-only method."""
+    prediction, revealed = _revealed_trajectory((0.0, 2.0, 1.25))
+    report = score_revealed_evaluation(revealed, (prediction,))
+    payload = report.artifacts[0].model_dump()
+    payload["artifact_type"] = "trajectory_ensemble"
+    payload["reference"]["artifact_type"] = "trajectory_ensemble"
+    payload["weight_scheme"] = "not_applicable"
+
+    with pytest.raises(
+        ValidationError,
+        match="weight scheme and point estimate method",
+    ):
+        ArtifactScore.model_validate(payload)
