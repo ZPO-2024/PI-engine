@@ -1,6 +1,7 @@
 """Trajectory analysis reports retain the exact geometry they describe."""
 
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal, localcontext
 import math
 import sys
 from zoneinfo import ZoneInfo
@@ -32,6 +33,7 @@ from pi_engine.schemas.trajectory import (
     TrajectoryEnsemble,
     TrajectoryHorizon,
     TrajectoryPoint,
+    summarize_trajectories,
 )
 from pi_engine.simulation.runner import simulate_deterministic
 from pi_engine.simulation.stochastic import simulate_stochastic
@@ -143,6 +145,88 @@ def _time_edge_trajectory(
             reference=f"time-edge:{trajectory_id}",
         ),
     )
+
+
+def _weighted_spread_point(
+    values: tuple[float, ...],
+    weights: tuple[float, ...],
+    *,
+    weight_kind: str,
+) -> object:
+    fixture = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        fixture.case,
+        fixture.model,
+        horizon=1,
+        samples=len(values),
+        seed=7,
+    )
+    members = tuple(
+        _copy_with_values(
+            member,
+            ({"x": value},),
+            trajectory_id=member.trajectory_id,
+            scenario_weight=ScenarioWeight(
+                kind=weight_kind,
+                value=weight,
+                justification="Task 11 weighted numeric regression",
+            ),
+        )
+        for member, value, weight in zip(
+            ensemble.trajectories, values, weights, strict=True
+        )
+    )
+    source = ensemble.model_copy(
+        update={"trajectories": members, "summary": None}
+    )
+    return analyze_trajectory_spread(
+        source, normalization_scales={"x": 1.0}
+    ).points[-1]
+
+
+def _decimal_population_std(
+    values: tuple[float, ...], weights: tuple[float, ...]
+) -> float:
+    with localcontext() as context:
+        context.prec = 200
+        decimal_values = tuple(Decimal.from_float(item) for item in values)
+        decimal_weights = tuple(Decimal.from_float(item) for item in weights)
+        total = sum(decimal_weights)
+        mean = sum(
+            value * weight
+            for value, weight in zip(
+                decimal_values, decimal_weights, strict=True
+            )
+        ) / total
+        variance = sum(
+            weight * (value - mean) ** 2
+            for value, weight in zip(
+                decimal_values, decimal_weights, strict=True
+            )
+        ) / total
+        return float(variance.sqrt())
+
+
+def _fold_trajectory_pair() -> tuple[
+    Trajectory, Trajectory, datetime, datetime
+]:
+    new_york = ZoneInfo("America/New_York")
+    start_at = datetime(2026, 11, 1, 0, 30, tzinfo=new_york)
+    first_fold = datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=0)
+    second_fold = datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=1)
+    baseline = _time_edge_trajectory(
+        trajectory_id="trajectory-fold-baseline",
+        start_at=start_at,
+        point_times=(first_fold, second_fold),
+        point_values=(1.0, 2.0),
+    )
+    perturbed = _time_edge_trajectory(
+        trajectory_id="trajectory-fold-perturbed",
+        start_at=start_at,
+        point_times=(first_fold, second_fold),
+        point_values=(2.0, 4.0),
+    )
+    return baseline, perturbed, first_fold, second_fold
 
 
 def test_linear_and_divergent_paths_retain_literal_ordered_distance_evidence() -> None:
@@ -1146,6 +1230,90 @@ def test_population_variance_centers_in_translated_coordinates(
 
 
 @pytest.mark.parametrize(
+    "values",
+    [
+        (1e16, 1e16 + 2.0),
+        (math.nextafter(1.0, 0.0), 1.0),
+    ],
+    ids=("large-offset", "adjacent-one"),
+)
+def test_equal_member_summary_and_spread_statistics_match_exactly(
+    values: tuple[float, float],
+) -> None:
+    """Schema summaries and spread analysis cannot disagree on one population."""
+    fixture = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        fixture.case, fixture.model, horizon=1, samples=2, seed=7
+    )
+    members = tuple(
+        _copy_with_values(
+            member,
+            ({"x": value},),
+            trajectory_id=member.trajectory_id,
+        )
+        for member, value in zip(ensemble.trajectories, values, strict=True)
+    )
+    summary = summarize_trajectories(members)
+    source = ensemble.model_copy(
+        update={"trajectories": members, "summary": summary}
+    )
+
+    spread = analyze_trajectory_spread(
+        source, normalization_scales={"x": 1.0}
+    ).points[-1]
+    statistics = summary.points[-1].statistics["x"]
+
+    assert statistics.mean == spread.mean
+    assert statistics.population_std == spread.population_std
+    assert statistics.population_variance == spread.population_variance.value
+    assert statistics.minimum == spread.minimum
+    assert statistics.maximum == spread.maximum
+
+
+@pytest.mark.parametrize(
+    ("weight_kind", "weights"),
+    [
+        ("probability", (1e-34, 0.5, 0.5)),
+        ("relative_weight", (1.0, 5e33, 5e33)),
+    ],
+    ids=("probability", "relative"),
+)
+@pytest.mark.parametrize("permutation", [(0, 1, 2), (2, 0, 1), (1, 2, 0)])
+def test_extreme_skew_weighted_variance_is_permutation_stable(
+    weight_kind: str,
+    weights: tuple[float, float, float],
+    permutation: tuple[int, int, int],
+) -> None:
+    """A rounded midpoint must not erase close dominant-member variance."""
+    source_values = (-1e16, 1e16, 1e16 + 2.0)
+    values = tuple(source_values[index] for index in permutation)
+    permuted_weights = tuple(weights[index] for index in permutation)
+    expected = _decimal_population_std(values, permuted_weights)
+
+    point = _weighted_spread_point(
+        values, permuted_weights, weight_kind=weight_kind
+    )
+
+    assert expected == 1.019803902718557
+    assert point.population_std == expected
+
+
+def test_weighted_anchor_uses_supported_close_value_with_max_and_zero_weights() -> None:
+    """A zero-weight extreme cannot select the anchor or perturb close support."""
+    maximum = sys.float_info.max
+    point = _weighted_spread_point(
+        (1e16, 1e16 + 2.0, -maximum),
+        (maximum, maximum, 0.0),
+        weight_kind="relative_weight",
+    )
+
+    assert point.weights == (0.5, 0.5, 0.0)
+    assert point.mean == 1e16
+    assert point.population_std == 1.0
+    assert (point.minimum, point.maximum) == (1e16, 1e16 + 2.0)
+
+
+@pytest.mark.parametrize(
     ("kind", "raw_weights", "expected_policy"),
     [
         ("probability", (0.99, 0.01), "probability"),
@@ -1525,6 +1693,117 @@ def test_spread_and_sensitivity_align_same_cached_zoneinfo_folds() -> None:
         1,
     ]
     assert tuple(point.at.fold for point in sensitivity.point_slopes) == (0, 1)
+
+
+@pytest.mark.parametrize("representation", ("serialized", "constructed"))
+def test_convergence_recomputation_rejects_fold_blind_pair_tampering(
+    representation: str,
+) -> None:
+    """A derived fold-0 pair endpoint cannot be rebound to fold 1."""
+    baseline, _, _, second_fold = _fold_trajectory_pair()
+    report = analyze_trajectory_convergence(
+        baseline, normalization_scales={"x": 1.0}
+    )
+    if representation == "serialized":
+        candidate: object = report.model_dump()
+        candidate["pairs"][0]["to_at"] = second_fold
+    else:
+        pair_payload = report.pairs[0].model_dump(exclude={"to_at"})
+        tampered_pair = type(report.pairs[0]).model_construct(
+            **pair_payload, to_at=second_fold
+        )
+        candidate = ConvergenceAnalysis.model_construct(
+            source=report.source,
+            trajectory_kind=report.trajectory_kind,
+            normalization=report.normalization,
+            pairs=(tampered_pair, *report.pairs[1:]),
+            patterns=report.patterns,
+        )
+
+    with pytest.raises(ValidationError, match="recompute from its source"):
+        ConvergenceAnalysis.model_validate(candidate)
+
+
+@pytest.mark.parametrize("representation", ("serialized", "constructed"))
+def test_spread_recomputation_rejects_fold_blind_evidence_tampering(
+    representation: str,
+) -> None:
+    """Spread point and classification-window folds are derived identity."""
+    baseline, perturbed, _, second_fold = _fold_trajectory_pair()
+    ensemble = TrajectoryEnsemble(
+        ensemble_id="ensemble-fold-tamper",
+        model_id=baseline.model_id,
+        model_version=baseline.model_version,
+        case_id=baseline.case_id,
+        trajectories=(baseline, perturbed),
+        provenance=baseline.provenance,
+    )
+    report = analyze_trajectory_spread(
+        ensemble, normalization_scales={"x": 1.0}
+    )
+    if representation == "serialized":
+        candidate: object = report.model_dump()
+        candidate["points"][1]["at"] = second_fold
+        candidate["classification_window"]["start_at"] = second_fold
+    else:
+        point_payload = report.points[1].model_dump(exclude={"at"})
+        tampered_point = type(report.points[1]).model_construct(
+            **point_payload, at=second_fold
+        )
+        window_payload = report.classification_window.model_dump(
+            exclude={"start_at"}
+        )
+        tampered_window = type(report.classification_window).model_construct(
+            **window_payload, start_at=second_fold
+        )
+        candidate = SpreadAnalysis.model_construct(
+            source=report.source,
+            source_kind=report.source_kind,
+            member_count=report.member_count,
+            weighting=report.weighting,
+            classification_window=tampered_window,
+            normalization=report.normalization,
+            points=(report.points[0], tampered_point, *report.points[2:]),
+            patterns=report.patterns,
+        )
+
+    with pytest.raises(ValidationError, match="recompute from its source"):
+        SpreadAnalysis.model_validate(candidate)
+
+
+@pytest.mark.parametrize("representation", ("serialized", "constructed"))
+def test_sensitivity_recomputation_rejects_fold_blind_point_tampering(
+    representation: str,
+) -> None:
+    """A derived fold-0 sensitivity point cannot be rebound to fold 1."""
+    baseline, perturbed, _, second_fold = _fold_trajectory_pair()
+    perturbation = ParameterPerturbation(
+        parameter_name="gain", delta=1.0, trajectory=perturbed
+    )
+    report = analyze_local_sensitivity(
+        baseline,
+        perturbations=(perturbation,),
+        normalization_scales={"x": 1.0},
+    )
+    if representation == "serialized":
+        candidate: object = report.model_dump()
+        candidate["point_slopes"][0]["at"] = second_fold
+    else:
+        point_payload = report.point_slopes[0].model_dump(exclude={"at"})
+        tampered_point = type(report.point_slopes[0]).model_construct(
+            **point_payload, at=second_fold
+        )
+        candidate = LocalSensitivityAnalysis.model_construct(
+            baseline=report.baseline,
+            perturbations=report.perturbations,
+            analysis_kind=report.analysis_kind,
+            normalization=report.normalization,
+            point_slopes=(tampered_point, *report.point_slopes[1:]),
+            summaries=report.summaries,
+        )
+
+    with pytest.raises(ValidationError, match="recompute from its sources"):
+        LocalSensitivityAnalysis.model_validate(candidate)
 
 
 def test_all_analyses_wrap_deep_time_reversal_in_typed_errors() -> None:

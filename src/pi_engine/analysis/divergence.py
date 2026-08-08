@@ -19,6 +19,15 @@ from pydantic import (
     model_validator,
 )
 
+from pi_engine._numeric import (
+    normalize_nonnegative_weights,
+    normalized_absolute_difference,
+    stable_population_mean_std,
+)
+from pi_engine.analysis._shared import (
+    canonical_model_content,
+    canonical_record_content,
+)
 from pi_engine.analysis.convergence import (
     ConvergenceAnalysisError,
     RepresentedMagnitude,
@@ -29,11 +38,6 @@ from pi_engine.analysis.convergence import (
     _revalidate_trajectory,
     _require_timezone,
     _utc,
-)
-from pi_engine.analysis._shared import (
-    normalize_nonnegative_weights,
-    normalized_absolute_difference,
-    translated_population_mean_std,
 )
 from pi_engine.schemas.common import FiniteFloat
 from pi_engine.schemas.trajectory import Trajectory, TrajectoryEnsemble
@@ -291,10 +295,14 @@ class SpreadAnalysis(_ImmutableSpreadSchema):
         if (
             self.source_kind != expected[0]
             or self.member_count != expected[1]
-            or self.weighting != expected[2]
-            or self.classification_window != expected[3]
-            or self.points != expected[4]
-            or self.patterns != expected[5]
+            or canonical_model_content(self.weighting)
+            != canonical_model_content(expected[2])
+            or canonical_model_content(self.classification_window)
+            != canonical_model_content(expected[3])
+            or canonical_record_content(self.points)
+            != canonical_record_content(expected[4])
+            or canonical_record_content(self.patterns)
+            != canonical_record_content(expected[5])
         ):
             raise ValueError("spread evidence must exactly recompute from its source")
         return self
@@ -409,7 +417,7 @@ def _spread_statistics(
     float,
     float,
 ]:
-    mean, std, minimum, maximum = translated_population_mean_std(
+    mean, std, minimum, maximum = stable_population_mean_std(
         values, weights, error_type=SpreadAnalysisError
     )
     computation_scale = max(abs(minimum), abs(maximum))

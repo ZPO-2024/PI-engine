@@ -17,11 +17,12 @@ from pydantic import (
     model_validator,
 )
 
-from pi_engine.analysis._shared import (
+from pi_engine._numeric import (
     finite_difference_or_none,
     normalized_absolute_difference,
     utc_instant_key,
 )
+from pi_engine.analysis._shared import canonical_record_content
 from pi_engine.schemas.common import FiniteFloat
 from pi_engine.schemas.trajectory import Trajectory
 
@@ -237,8 +238,10 @@ class ConvergenceAnalysis(_ImmutableAnalysisSchema):
         expected = _derive_convergence(self.source, self.normalization)
         if (
             self.trajectory_kind != expected[0]
-            or self.pairs != expected[1]
-            or self.patterns != expected[2]
+            or canonical_record_content(self.pairs)
+            != canonical_record_content(expected[1])
+            or canonical_record_content(self.patterns)
+            != canonical_record_content(expected[2])
         ):
             raise ValueError(
                 "convergence evidence must exactly recompute from its source"

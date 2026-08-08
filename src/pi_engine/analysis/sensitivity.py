@@ -18,6 +18,8 @@ from pydantic import (
     model_validator,
 )
 
+from pi_engine._numeric import finite_difference
+from pi_engine.analysis._shared import canonical_record_content
 from pi_engine.analysis.convergence import (
     ConvergenceAnalysisError,
     VariableNormalization,
@@ -27,7 +29,6 @@ from pi_engine.analysis.convergence import (
     _require_timezone,
     _utc,
 )
-from pi_engine.analysis._shared import finite_difference
 from pi_engine.schemas.common import FiniteFloat
 from pi_engine.schemas.trajectory import Trajectory
 
@@ -174,8 +175,10 @@ class LocalSensitivityAnalysis(_ImmutableSensitivitySchema):
         )
         if (
             self.analysis_kind != expected[0]
-            or self.point_slopes != expected[1]
-            or self.summaries != expected[2]
+            or canonical_record_content(self.point_slopes)
+            != canonical_record_content(expected[1])
+            or canonical_record_content(self.summaries)
+            != canonical_record_content(expected[2])
         ):
             raise ValueError(
                 "local sensitivity evidence must exactly recompute from its sources"

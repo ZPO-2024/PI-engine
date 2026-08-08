@@ -374,6 +374,72 @@ def test_scalar_summary_rejects_unrepresentable_extreme_variance_deliberately() 
         summarize_trajectories(trajectories)
 
 
+@pytest.mark.parametrize("representation", ("serialized", "constructed"))
+def test_ensemble_summary_revalidation_rejects_fold_blind_time_tampering(
+    representation: str,
+) -> None:
+    """A derived fold-0 summary point cannot be rebound to fold 1."""
+    new_york = ZoneInfo("America/New_York")
+    start_at = datetime(2026, 11, 1, 0, 30, tzinfo=new_york)
+    first_fold = datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=0)
+    second_fold = datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=1)
+    state = trajectory_payload()["initial_state"].model_copy(
+        update={"at": start_at}
+    )
+    trajectories = tuple(
+        Trajectory.model_validate(
+            trajectory_payload(
+                trajectory_id=f"trajectory-fold-summary-{index}",
+                initial_state=state,
+                horizon=TrajectoryHorizon(
+                    start_at=start_at, end_at=second_fold
+                ),
+                points=(
+                    TrajectoryPoint(at=first_fold, values={"flow": value}),
+                    TrajectoryPoint(at=second_fold, values={"flow": value - 1.0}),
+                ),
+                scenario_weight=None,
+            )
+        )
+        for index, value in enumerate((12.0, 10.0))
+    )
+    summary = summarize_trajectories(trajectories)
+    ensemble = TrajectoryEnsemble(
+        ensemble_id="ensemble-fold-summary",
+        model_id=trajectories[0].model_id,
+        model_version=trajectories[0].model_version,
+        case_id=trajectories[0].case_id,
+        trajectories=trajectories,
+        summary=summary,
+        provenance=provenance("Task 11 fold summary regression"),
+    )
+    if representation == "serialized":
+        candidate: object = ensemble.model_dump()
+        candidate["summary"]["points"][0]["at"] = second_fold
+    else:
+        tampered_point = type(summary.points[0]).model_construct(
+            at=second_fold,
+            statistics=summary.points[0].statistics,
+        )
+        tampered_summary = type(summary).model_construct(
+            points=(tampered_point, *summary.points[1:])
+        )
+        candidate = TrajectoryEnsemble.model_construct(
+            ensemble_id=ensemble.ensemble_id,
+            model_id=ensemble.model_id,
+            model_version=ensemble.model_version,
+            case_id=ensemble.case_id,
+            trajectories=ensemble.trajectories,
+            seed=ensemble.seed,
+            rng_scheme=ensemble.rng_scheme,
+            summary=tampered_summary,
+            provenance=ensemble.provenance,
+        )
+
+    with pytest.raises(ValidationError, match="summary must match"):
+        TrajectoryEnsemble.model_validate(candidate)
+
+
 def test_trajectory_ensemble_rejects_mixed_model_or_case_identity() -> None:
     """Mixing unrelated trajectories would make ensemble summaries invalid."""
     mismatched = Trajectory.model_validate(

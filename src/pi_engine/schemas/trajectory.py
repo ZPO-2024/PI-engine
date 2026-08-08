@@ -16,6 +16,7 @@ from pydantic import (
     model_validator,
 )
 
+from pi_engine._numeric import stable_population_mean_std, utc_instant_key
 from pi_engine.schemas.common import FiniteFloat, NumericValue, Provenance
 from pi_engine.schemas.state import StateEstimate
 
@@ -50,29 +51,6 @@ def _require_timezone(value: datetime, field_name: str) -> datetime:
     return value
 
 
-def _utc_instant_key(value: datetime) -> int:
-    """Return absolute microseconds without constructing an out-of-range UTC date."""
-    try:
-        offset = value.utcoffset()
-        if offset is None:
-            raise ValueError("datetime must include a timezone")
-        local_microseconds = (
-            (
-                ((value.toordinal() * 24 + value.hour) * 60 + value.minute) * 60
-                + value.second
-            )
-            * 1_000_000
-            + value.microsecond
-        )
-        offset_microseconds = (
-            (offset.days * 86_400 + offset.seconds) * 1_000_000
-            + offset.microseconds
-        )
-        return local_microseconds - offset_microseconds
-    except (OverflowError, TypeError, ValueError) as exc:
-        raise ValueError("datetime must define a valid absolute instant") from exc
-
-
 class TrajectoryHorizon(_ImmutablePredictionSchema):
     """Concrete start and end of a simulated trajectory."""
 
@@ -89,7 +67,7 @@ class TrajectoryHorizon(_ImmutablePredictionSchema):
 
     @model_validator(mode="after")
     def end_must_follow_start(self) -> "TrajectoryHorizon":
-        if _utc_instant_key(self.end_at) <= _utc_instant_key(self.start_at):
+        if utc_instant_key(self.end_at) <= utc_instant_key(self.start_at):
             raise ValueError("horizon end_at must be after start_at")
         return self
 
@@ -198,14 +176,14 @@ class Trajectory(_ImmutablePredictionSchema):
 
     @model_validator(mode="after")
     def validate_timeline(self) -> "Trajectory":
-        start_key = _utc_instant_key(self.horizon.start_at)
-        end_key = _utc_instant_key(self.horizon.end_at)
-        if _utc_instant_key(self.initial_state.at) != start_key:
+        start_key = utc_instant_key(self.horizon.start_at)
+        end_key = utc_instant_key(self.horizon.end_at)
+        if utc_instant_key(self.initial_state.at) != start_key:
             raise ValueError("initial state time must match horizon start_at")
 
         previous_key: int | None = None
         for point in self.points:
-            point_key = _utc_instant_key(point.at)
+            point_key = utc_instant_key(point.at)
             if not start_key <= point_key <= end_key:
                 raise ValueError("trajectory points must fall within the horizon")
             if previous_key is not None and point_key <= previous_key:
@@ -312,7 +290,7 @@ def summarize_trajectories(
             if len(trajectory.points) != len(reference_points):
                 raise ValueError("trajectory samples must share point alignment")
             point = trajectory.points[point_index]
-            if _utc_instant_key(point.at) != _utc_instant_key(reference_point.at):
+            if utc_instant_key(point.at) != utc_instant_key(reference_point.at):
                 raise ValueError("trajectory samples must share time alignment")
             if set(point.values) != set(expected_variables):
                 raise ValueError("trajectory samples must share variable alignment")
@@ -328,35 +306,16 @@ def summarize_trajectories(
         statistics: dict[str, ScalarSummaryStatistics] = {}
         for variable, values in values_by_variable.items():
             count = len(values)
-            scale = max(abs(value) for value in values)
-            if scale == 0.0:
-                mean = 0.0
-                normalized_variance = 0.0
-            else:
-                normalized_values = tuple(value / scale for value in values)
-                normalized_mean = math.fsum(normalized_values) / count
-                mean = scale * normalized_mean
-                normalized_variance = (
-                    math.fsum(
-                        (value - normalized_mean) ** 2
-                        for value in normalized_values
-                    )
-                    / count
+            mean, standard_deviation, minimum, maximum = (
+                stable_population_mean_std(
+                    tuple(values),
+                    tuple(1.0 for _ in values),
+                    error_type=TrajectorySummaryError,
                 )
-            if not math.isfinite(mean):
-                raise TrajectorySummaryError(
-                    f"summary mean is not representable for {variable}"
-                )
-            if normalized_variance == 0.0:
-                standard_deviation = 0.0
+            )
+            if standard_deviation == 0.0:
                 variance = 0.0
             else:
-                standard_deviation = scale * math.sqrt(normalized_variance)
-                if not math.isfinite(standard_deviation):
-                    raise TrajectorySummaryError(
-                        "summary population standard deviation is not "
-                        f"representable for {variable}"
-                    )
                 if standard_deviation > math.sqrt(sys.float_info.max):
                     raise TrajectorySummaryError(
                         "summary population variance is not representable "
@@ -373,8 +332,8 @@ def summarize_trajectories(
                 mean=float(mean),
                 population_std=float(standard_deviation),
                 population_variance=float(variance),
-                minimum=float(min(values)),
-                maximum=float(max(values)),
+                minimum=float(minimum),
+                maximum=float(maximum),
             )
         summary_points.append(
             TrajectorySummaryPoint(
@@ -468,8 +427,8 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
                     "trajectory ensemble member RNG scheme must match ensemble"
                 )
             if (
-                _utc_instant_key(trajectory.initial_state.at)
-                != _utc_instant_key(expected_initial_state.at)
+                utc_instant_key(trajectory.initial_state.at)
+                != utc_instant_key(expected_initial_state.at)
                 or trajectory.initial_state.observed != expected_initial_state.observed
                 or trajectory.initial_state.latent != expected_initial_state.latent
                 or trajectory.initial_state.uncertainty
@@ -478,10 +437,10 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
             ):
                 raise ValueError("trajectory ensemble members must share initial state")
             if (
-                _utc_instant_key(trajectory.horizon.start_at)
-                != _utc_instant_key(expected_horizon.start_at)
-                or _utc_instant_key(trajectory.horizon.end_at)
-                != _utc_instant_key(expected_horizon.end_at)
+                utc_instant_key(trajectory.horizon.start_at)
+                != utc_instant_key(expected_horizon.start_at)
+                or utc_instant_key(trajectory.horizon.end_at)
+                != utc_instant_key(expected_horizon.end_at)
             ):
                 raise ValueError(
                     "trajectory ensemble members must share requested horizon"
@@ -520,7 +479,9 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
 
         if self.summary is not None:
             expected_summary = summarize_trajectories(self.trajectories)
-            if self.summary != expected_summary:
+            if self.summary.model_dump(
+                mode="json"
+            ) != expected_summary.model_dump(mode="json"):
                 raise ValueError(
                     "trajectory ensemble summary must match aligned raw samples"
                 )
