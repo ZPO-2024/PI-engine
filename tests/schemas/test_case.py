@@ -96,6 +96,24 @@ def test_case_preserves_observation_units_provenance_and_uncertainty() -> None:
     )
 
 
+def test_observation_accepts_finite_numeric_vector_and_round_trips_as_json() -> None:
+    """Rejecting vector measurements would break hybrid scalar/vector cases."""
+    observation = make_observation(value=[12.5, 13.25])
+
+    assert observation.value == (12.5, 13.25)
+    assert Observation.model_validate_json(observation.model_dump_json()) == observation
+    assert observation.model_dump(mode="json")["value"] == [12.5, 13.25]
+
+
+@pytest.mark.parametrize("nonfinite", [float("inf"), float("-inf"), float("nan")])
+def test_observation_rejects_nonfinite_numeric_vector(nonfinite: float) -> None:
+    """A nonfinite vector element would not survive a standards-compliant JSON round trip."""
+    with pytest.raises(ValidationError) as exc_info:
+        make_observation(value=[1.0, nonfinite])
+
+    assert "finite_number" in {error["type"] for error in exc_info.value.errors()}
+
+
 @pytest.mark.parametrize("time_field", ["event_time", "available_at"])
 def test_observation_rejects_naive_event_or_availability_time(time_field: str) -> None:
     """A naïve event or availability time would make cutoff enforcement ambiguous."""
@@ -148,6 +166,18 @@ def test_state_rejects_negative_uncertainty() -> None:
         )
 
 
+def test_state_rejects_negative_uncertainty_vector() -> None:
+    """Skipping vector elements would allow invalid negative uncertainty magnitudes."""
+    with pytest.raises(ValidationError, match="uncertainty"):
+        StateEstimate(
+            at=CUTOFF,
+            observed={"flow": [12.5, 13.25]},
+            latent={},
+            uncertainty={"flow": [0.4, -0.1]},
+            boundary={},
+        )
+
+
 def test_state_rejects_naive_estimate_time() -> None:
     """A naïve state time would make its relationship to the cutoff ambiguous."""
     with pytest.raises(ValidationError):
@@ -158,6 +188,56 @@ def test_state_rejects_naive_estimate_time() -> None:
             uncertainty={"flow": 0.4},
             boundary={},
         )
+
+
+def test_state_accepts_numeric_vectors_and_round_trips_as_json() -> None:
+    """Collapsing vector state components to scalars would lose hybrid state structure."""
+    state = StateEstimate(
+        at=CUTOFF,
+        observed={"flow": [12.5, 13.25]},
+        latent={"rainfall": [2.0, 2.5]},
+        uncertainty={"flow": [0.4, 0.5]},
+        boundary={"rainfall": [1.0, 1.5]},
+    )
+
+    assert state.observed["flow"] == (12.5, 13.25)
+    assert StateEstimate.model_validate_json(state.model_dump_json()) == state
+    assert state.model_dump(mode="json") == {
+        "at": "2026-08-08T12:00:00Z",
+        "observed": {"flow": [12.5, 13.25]},
+        "latent": {"rainfall": [2.0, 2.5]},
+        "uncertainty": {"flow": [0.4, 0.5]},
+        "boundary": {"rainfall": [1.0, 1.5]},
+    }
+
+
+@pytest.mark.parametrize("component", ["observed", "latent", "uncertainty", "boundary"])
+def test_state_rejects_nonfinite_vector_in_each_component(component: str) -> None:
+    """A nonfinite state vector would make simulation inputs non-serializable."""
+    values: dict[str, object] = {
+        "at": CUTOFF,
+        "observed": {},
+        "latent": {},
+        "uncertainty": {},
+        "boundary": {},
+    }
+    values[component] = {"flow": [1.0, float("inf")]}
+
+    with pytest.raises(ValidationError) as exc_info:
+        StateEstimate.model_validate(values)
+
+    assert "finite_number" in {error["type"] for error in exc_info.value.errors()}
+
+
+@pytest.mark.parametrize("component", ["observed", "latent", "uncertainty", "boundary"])
+def test_state_component_mappings_cannot_be_mutated_after_validation(
+    component: str,
+) -> None:
+    """Mutable state maps would allow callers to bypass canonical and uncertainty validation."""
+    state = make_case().state
+
+    with pytest.raises(TypeError):
+        getattr(state, component)["not_canonical"] = -1.0
 
 
 @pytest.mark.parametrize("component", ["observed", "latent", "uncertainty", "boundary"])
@@ -233,6 +313,75 @@ def test_system_graph_rejects_duplicate_node_ids() -> None:
         )
 
 
+def test_system_graph_round_trips_explicit_boundary_and_geometry_context() -> None:
+    """Dropping boundary or geometry/topology context would make the graph incomplete."""
+    graph = SystemGraph.model_validate(
+        {
+            "nodes": ({"node_id": "river", "variable_refs": ("flow",)},),
+            "edges": (),
+            "boundary_relationships": (
+                {
+                    "node_id": "river",
+                    "variable_ref": "rainfall",
+                    "relationship_type": "inflow_boundary",
+                },
+            ),
+            "geometry_metadata": {"coordinate_system": "local", "dimensions": 2},
+            "topology_metadata": {"network_type": "directed", "acyclic": True},
+        }
+    )
+
+    assert SystemGraph.model_validate_json(graph.model_dump_json()) == graph
+    assert graph.model_dump(mode="json") == {
+        "nodes": [{"node_id": "river", "variable_refs": ["flow"]}],
+        "edges": [],
+        "boundary_relationships": [
+            {
+                "node_id": "river",
+                "variable_ref": "rainfall",
+                "relationship_type": "inflow_boundary",
+            }
+        ],
+        "geometry_metadata": {"coordinate_system": "local", "dimensions": 2},
+        "topology_metadata": {"network_type": "directed", "acyclic": True},
+    }
+
+
+@pytest.mark.parametrize("metadata_field", ["geometry_metadata", "topology_metadata"])
+def test_system_graph_metadata_cannot_be_mutated_after_validation(
+    metadata_field: str,
+) -> None:
+    """Mutable graph metadata would allow the validated system definition to drift."""
+    graph = SystemGraph.model_validate(
+        {
+            "nodes": (),
+            "edges": (),
+            metadata_field: {"kind": "declared"},
+        }
+    )
+
+    with pytest.raises(TypeError):
+        getattr(graph, metadata_field)["kind"] = "mutated"
+
+
+def test_system_graph_rejects_boundary_relationship_with_unknown_node() -> None:
+    """A boundary relationship pointing outside the node set would be unresolved."""
+    with pytest.raises(ValidationError, match="unknown node"):
+        SystemGraph.model_validate(
+            {
+                "nodes": (),
+                "edges": (),
+                "boundary_relationships": (
+                    {
+                        "node_id": "missing",
+                        "variable_ref": "flow",
+                        "relationship_type": "external_input",
+                    },
+                ),
+            }
+        )
+
+
 def test_case_rejects_graph_node_with_unknown_variable_reference() -> None:
     """Graph nodes must refer to the same canonical variables as state and observations."""
     with pytest.raises(ValidationError, match="variable_refs"):
@@ -244,6 +393,26 @@ def test_case_rejects_graph_node_with_unknown_variable_reference() -> None:
                 edges=(),
             )
         )
+
+
+def test_case_rejects_boundary_relationship_with_unknown_variable_reference() -> None:
+    """Boundary variable references must share the case's canonical variable registry."""
+    graph = SystemGraph.model_validate(
+        {
+            "nodes": ({"node_id": "river", "variable_refs": ("flow",)},),
+            "edges": (),
+            "boundary_relationships": (
+                {
+                    "node_id": "river",
+                    "variable_ref": "not_canonical",
+                    "relationship_type": "external_input",
+                },
+            ),
+        }
+    )
+
+    with pytest.raises(ValidationError, match="unknown variables"):
+        make_case(graph=graph)
 
 
 def test_case_rejects_duplicate_canonical_variable_names() -> None:
@@ -260,10 +429,37 @@ def test_case_rejects_duplicate_canonical_variable_names() -> None:
 def test_case_rejects_withheld_outcomes_in_prediction_input() -> None:
     """Embedding withheld outcomes would defeat cutoff-safe prediction evaluation."""
     payload = make_case().model_dump()
-    payload["withheld_outcomes"] = ({"variable": "flow", "value": 14.0},)
+    payload["observations"][0]["withheld_outcomes"] = (
+        {"variable": "flow", "value": 14.0},
+    )
 
     with pytest.raises(ValidationError) as exc_info:
         Case.model_validate(payload)
 
-    assert exc_info.value.errors()[0]["loc"] == ("withheld_outcomes",)
+    assert exc_info.value.errors()[0]["loc"] == (
+        "observations",
+        0,
+        "withheld_outcomes",
+    )
+    assert exc_info.value.errors()[0]["type"] == "extra_forbidden"
+
+
+def test_case_rejects_outcome_bearing_observation_subclass_instance() -> None:
+    """Trusting a validated subclass would retain outcome data across the cutoff boundary."""
+
+    class OutcomeBearingObservation(Observation):
+        withheld_outcomes: tuple[dict[str, object], ...]
+
+    values = make_observation().model_dump()
+    values["withheld_outcomes"] = ({"variable": "flow", "value": 14.0},)
+    outcome_bearing = OutcomeBearingObservation.model_validate(values)
+
+    with pytest.raises(ValidationError) as exc_info:
+        make_case(observations=(outcome_bearing,))
+
+    assert exc_info.value.errors()[0]["loc"] == (
+        "observations",
+        0,
+        "withheld_outcomes",
+    )
     assert exc_info.value.errors()[0]["type"] == "extra_forbidden"

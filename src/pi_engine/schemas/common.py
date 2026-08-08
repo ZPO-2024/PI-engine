@@ -2,8 +2,16 @@
 
 from datetime import datetime
 from enum import Enum
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+NumericVector = Annotated[tuple[FiniteFloat, ...], Field(min_length=1)]
+NumericValue = FiniteFloat | NumericVector
+JsonScalar = str | int | FiniteFloat | bool | None
+ObservationValue = JsonScalar | NumericVector
 
 
 class UncertaintyClass(str, Enum):

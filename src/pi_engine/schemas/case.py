@@ -91,4 +91,16 @@ class Case(BaseModel):
                 raise ValueError(
                     f"graph variable_refs contain unknown variables: {unknown_text}"
                 )
+
+        unknown_boundary_variables = {
+            relationship.variable_ref
+            for relationship in self.graph.boundary_relationships
+            if relationship.variable_ref not in known_variables
+        }
+        if unknown_boundary_variables:
+            unknown_text = ", ".join(sorted(unknown_boundary_variables))
+            raise ValueError(
+                "boundary relationships reference unknown variables: "
+                f"{unknown_text}"
+            )
         return self
