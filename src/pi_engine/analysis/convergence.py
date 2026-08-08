@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import datetime
 import math
-import sys
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -18,6 +17,11 @@ from pydantic import (
     model_validator,
 )
 
+from pi_engine.analysis._shared import (
+    finite_difference_or_none,
+    normalized_absolute_difference,
+    utc_instant_key,
+)
 from pi_engine.schemas.common import FiniteFloat
 from pi_engine.schemas.trajectory import Trajectory
 
@@ -45,11 +49,8 @@ def _require_timezone(value: datetime, field_name: str) -> datetime:
     return value
 
 
-def _utc(value: datetime, error_type: type[ValueError]) -> datetime:
-    try:
-        return value.astimezone(UTC)
-    except (OverflowError, ValueError) as exc:
-        raise error_type("analysis time cannot be normalized to UTC") from exc
+def _utc(value: datetime, error_type: type[ValueError]) -> int:
+    return utc_instant_key(value, role="analysis time", error_type=error_type)
 
 
 def _strict_scalar(value: object, role: str, error_type: type[ValueError]) -> float:
@@ -267,7 +268,7 @@ def _revalidate_trajectory(
         else:
             raise TypeError("source must be a Trajectory")
         result = Trajectory.model_validate(payload)
-    except (TypeError, ValueError, ValidationError) as exc:
+    except (OverflowError, TypeError, ValueError, ValidationError) as exc:
         raise error_type("source must be a valid Trajectory") from exc
     _validated_timeline(result, error_type)
     return result
@@ -281,7 +282,9 @@ def _validated_timeline(
     if _utc(trajectory.initial_state.at, error_type) != start:
         raise error_type("initial state must align exactly with horizon start")
     times = tuple(_utc(point.at, error_type) for point in trajectory.points)
-    if any(later <= earlier for earlier, later in zip((start, *times), times)):
+    if any(item < start or item > end for item in times):
+        raise error_type("trajectory times must fall within the requested horizon")
+    if any(later <= earlier for earlier, later in zip(times, times[1:])):
         raise error_type("trajectory times must be strictly ordered UTC instants")
     if times[-1] != end:
         raise error_type("trajectory must align exactly with the requested horizon")
@@ -424,20 +427,22 @@ def _aligned_rows(
                     raw, f"value for {spec.variable}", error_type
                 )
         rows.append((at, flattened))
+    if len(rows) > 1 and _utc(rows[1][0], error_type) == _utc(
+        rows[0][0], error_type
+    ):
+        if rows[1][1] != rows[0][1]:
+            raise error_type(
+                "trajectory point at horizon start must exactly match initial state"
+            )
+        del rows[1]
     return tuple(rows)
 
 
 def _absolute_difference(left: float, right: float) -> RepresentedMagnitude:
-    scale = max(abs(left), abs(right))
-    if scale == 0.0:
-        return RepresentedMagnitude(kind="finite", value=0.0)
-    factor = abs((right / scale) - (left / scale))
-    if factor != 0.0 and scale > sys.float_info.max / factor:
+    difference = finite_difference_or_none(left, right)
+    if difference is None:
         return RepresentedMagnitude(kind="above_float_range")
-    result = scale * factor
-    if left != right and result == 0.0:
-        return RepresentedMagnitude(kind="below_float_resolution")
-    return RepresentedMagnitude(kind="finite", value=float(result))
+    return RepresentedMagnitude(kind="finite", value=abs(difference))
 
 
 def _normalized_difference(
@@ -446,21 +451,13 @@ def _normalized_difference(
     normalization_scale: float,
     error_type: type[ValueError],
 ) -> float:
-    computation_scale = max(abs(left), abs(right))
-    if computation_scale == 0.0:
-        return 0.0
-    factor = abs(
-        (right / computation_scale) - (left / computation_scale)
+    return normalized_absolute_difference(
+        left,
+        right,
+        normalization_scale,
+        role="normalized distance",
+        error_type=error_type,
     )
-    ratio = computation_scale / normalization_scale
-    if factor != 0.0 and ratio > sys.float_info.max / factor:
-        raise error_type("normalized distance is not representable as finite")
-    result = ratio * factor
-    if not math.isfinite(result):
-        raise error_type("normalized distance is not representable as finite")
-    if left != right and result == 0.0:
-        raise error_type("normalized distance is not representable as finite")
-    return float(result)
 
 
 def _step_pattern(distances: tuple[float, ...]) -> ObservedStepPattern:

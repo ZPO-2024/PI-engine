@@ -1,4 +1,5 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -179,6 +180,89 @@ def test_trajectory_rejects_misaligned_or_unordered_points() -> None:
                 )
             )
         )
+
+
+def test_trajectory_orders_same_cached_zoneinfo_folds_by_absolute_instant() -> None:
+    """Repeated wall time across a DST fold still has an unambiguous order."""
+    new_york = ZoneInfo("America/New_York")
+    horizon_start = datetime(2026, 11, 1, 0, 30, tzinfo=new_york)
+    first_fold = datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=0)
+    second_fold = datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=1)
+    horizon_end = datetime(2026, 11, 1, 2, 30, tzinfo=new_york)
+    assert TrajectoryHorizon(start_at=first_fold, end_at=second_fold).end_at.fold == 1
+    with pytest.raises(ValidationError, match="after start_at"):
+        TrajectoryHorizon(start_at=second_fold, end_at=first_fold)
+    state = trajectory_payload()["initial_state"].model_copy(
+        update={"at": horizon_start}
+    )
+    horizon = TrajectoryHorizon(start_at=horizon_start, end_at=horizon_end)
+
+    trajectory = Trajectory.model_validate(
+        trajectory_payload(
+            initial_state=state,
+            horizon=horizon,
+            points=(
+                TrajectoryPoint(at=first_fold, values={"flow": 11.0}),
+                TrajectoryPoint(at=second_fold, values={"flow": 10.0}),
+                TrajectoryPoint(at=horizon_end, values={"flow": 9.0}),
+            ),
+        )
+    )
+
+    assert trajectory.points[:2] == (
+        TrajectoryPoint(at=first_fold, values={"flow": 11.0}),
+        TrajectoryPoint(at=second_fold, values={"flow": 10.0}),
+    )
+    with pytest.raises(ValidationError, match="strictly ordered"):
+        Trajectory.model_validate(
+            trajectory_payload(
+                initial_state=state,
+                horizon=horizon,
+                points=(
+                    TrajectoryPoint(at=second_fold, values={"flow": 10.0}),
+                    TrajectoryPoint(at=first_fold, values={"flow": 11.0}),
+                    TrajectoryPoint(at=horizon_end, values={"flow": 9.0}),
+                ),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("horizon_start", "horizon_end"),
+    [
+        (
+            datetime(1, 1, 1, 0, tzinfo=timezone(timedelta(hours=14))),
+            datetime(1, 1, 1, 1, tzinfo=timezone(timedelta(hours=14))),
+        ),
+        (
+            datetime(9999, 12, 31, 22, tzinfo=timezone(-timedelta(hours=12))),
+            datetime(9999, 12, 31, 23, tzinfo=timezone(-timedelta(hours=12))),
+        ),
+    ],
+    ids=("year-1-positive-offset", "year-9999-negative-offset"),
+)
+def test_trajectory_orders_extreme_offset_instants_without_constructing_utc(
+    horizon_start: datetime, horizon_end: datetime
+) -> None:
+    """Valid boundary-year instants need not be constructible as UTC datetimes."""
+    state = trajectory_payload()["initial_state"].model_copy(
+        update={"at": horizon_start}
+    )
+
+    trajectory = Trajectory.model_validate(
+        trajectory_payload(
+            initial_state=state,
+            horizon=TrajectoryHorizon(
+                start_at=horizon_start,
+                end_at=horizon_end,
+            ),
+            points=(
+                TrajectoryPoint(at=horizon_end, values={"flow": 8.25}),
+            ),
+        )
+    )
+
+    assert trajectory.points[0].at == horizon_end
 
 
 def test_trajectory_nested_values_are_deeply_immutable() -> None:

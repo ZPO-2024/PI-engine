@@ -1,6 +1,6 @@
 """Trajectory analysis reports retain the exact geometry they describe."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 import math
 import sys
 from zoneinfo import ZoneInfo
@@ -27,6 +27,7 @@ from pi_engine.analysis.sensitivity import (
 from pi_engine.schemas.common import Provenance
 from pi_engine.schemas.state import StateEstimate
 from pi_engine.schemas.trajectory import (
+    ScenarioWeight,
     Trajectory,
     TrajectoryEnsemble,
     TrajectoryHorizon,
@@ -104,6 +105,42 @@ def _control_trajectory(
             source="Task 11 known control path",
             observed_at=case.prediction_cutoff,
             reference=f"control:{fixture.name}",
+        ),
+    )
+
+
+def _time_edge_trajectory(
+    *,
+    trajectory_id: str,
+    start_at: datetime,
+    point_times: tuple[datetime, ...],
+    point_values: tuple[float, ...] | None = None,
+) -> Trajectory:
+    values = point_values or tuple(
+        float(index) for index in range(1, len(point_times) + 1)
+    )
+    return Trajectory(
+        trajectory_id=trajectory_id,
+        model_id="time-edge-model",
+        model_version="1",
+        case_id="time-edge-case",
+        initial_state=StateEstimate(
+            at=start_at,
+            observed={"x": 0.0},
+            latent={},
+            uncertainty={},
+            boundary={},
+        ),
+        horizon=TrajectoryHorizon(start_at=start_at, end_at=point_times[-1]),
+        points=tuple(
+            TrajectoryPoint(at=at, values={"x": value})
+            for at, value in zip(point_times, values, strict=True)
+        ),
+        constraints_encountered=(),
+        provenance=Provenance(
+            source="Task 11 time edge regression",
+            observed_at=start_at,
+            reference=f"time-edge:{trajectory_id}",
         ),
     )
 
@@ -956,3 +993,597 @@ def test_nonzero_subnormal_geometry_never_collapses_to_false_zero() -> None:
             ),
             normalization_scales={"x": 1.0},
         )
+
+
+def test_direct_finite_subtraction_preserves_constant_unit_steps() -> None:
+    """Scaling before subtraction must not turn exact unit steps into a mixed pattern."""
+    fixture = linear_convergence()
+    source = simulate_deterministic(fixture.case, fixture.model, horizon=3)
+    initial = source.initial_state.model_copy(update={"observed": {"x": 6.0}})
+    trajectory = _copy_with_values(
+        source,
+        ({"x": 7.0}, {"x": 8.0}, {"x": 9.0}),
+        trajectory_id=f"{source.trajectory_id}-constant-unit-steps",
+        initial_state=initial,
+    )
+
+    report = analyze_trajectory_convergence(
+        trajectory, normalization_scales={"x": 1.0}
+    )
+
+    assert report.patterns[0].normalized_distances == (1.0, 1.0, 1.0)
+    assert report.patterns[0].observed_pattern == "constant_step_distance"
+
+
+def test_direct_finite_subtraction_preserves_large_offsets_and_adjacent_floats() -> None:
+    """Finite differences are exact float evidence even when operands are large."""
+    fixture = linear_convergence()
+    source = simulate_deterministic(fixture.case, fixture.model, horizon=1)
+    left = 1e16
+    right = left + 2.0
+    initial = source.initial_state.model_copy(update={"observed": {"x": left}})
+    trajectory = _copy_with_values(
+        source,
+        ({"x": right},),
+        trajectory_id=f"{source.trajectory_id}-large-offset",
+        initial_state=initial,
+    )
+
+    distance = analyze_trajectory_convergence(
+        trajectory, normalization_scales={"x": 1.0}
+    ).pairs[0].distances[0]
+    assert distance.absolute_distance.value == 2.0
+    assert distance.normalized_distance == 2.0
+
+    ensemble_fixture = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        ensemble_fixture.case,
+        ensemble_fixture.model,
+        horizon=1,
+        samples=2,
+        seed=7,
+    )
+    members = tuple(
+        _copy_with_values(
+            member,
+            ({"x": value},),
+            trajectory_id=member.trajectory_id,
+        )
+        for member, value in zip(
+            ensemble.trajectories, (left, right), strict=True
+        )
+    )
+    offset_ensemble = ensemble.model_copy(
+        update={"trajectories": members, "summary": None}
+    )
+    spread = analyze_trajectory_spread(
+        offset_ensemble, normalization_scales={"x": 1.0}
+    ).points[-1]
+    assert spread.spread_range.value == 2.0
+    assert spread.normalized_range == 2.0
+
+    baseline = _copy_with_values(
+        source,
+        ({"x": left},),
+        trajectory_id=f"{source.trajectory_id}-offset-baseline",
+    )
+    perturbed = _copy_with_values(
+        baseline,
+        ({"x": right},),
+        trajectory_id=f"{source.trajectory_id}-offset-perturbed",
+    )
+    sensitivity = analyze_local_sensitivity(
+        baseline,
+        (
+            ParameterPerturbation(
+                parameter_name="offset", delta=1.0, trajectory=perturbed
+            ),
+        ),
+        normalization_scales={"x": 1.0},
+    ).point_slopes[0]
+    assert sensitivity.raw_difference == 2.0
+    assert sensitivity.slope == 2.0
+
+    adjacent = math.nextafter(1.0, math.inf)
+    adjacent_perturbed = _copy_with_values(
+        baseline,
+        ({"x": adjacent},),
+        trajectory_id=f"{source.trajectory_id}-adjacent-perturbed",
+    )
+    adjacent_baseline = _copy_with_values(
+        baseline,
+        ({"x": 1.0},),
+        trajectory_id=f"{source.trajectory_id}-adjacent-baseline",
+    )
+    adjacent_slope = analyze_local_sensitivity(
+        adjacent_baseline,
+        (
+            ParameterPerturbation(
+                parameter_name="adjacent",
+                delta=1.0,
+                trajectory=adjacent_perturbed,
+            ),
+        ),
+        normalization_scales={"x": 1.0},
+    ).point_slopes[0]
+    assert adjacent_slope.raw_difference == math.ulp(1.0)
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_mean", "expected_std"),
+    [
+        ((math.nextafter(1.0, 0.0), 1.0), 1.0, 2.0**-54),
+        ((1e16, 1e16 + 2.0), 1e16, 1.0),
+    ],
+    ids=("adjacent-one", "large-offset"),
+)
+def test_population_variance_centers_in_translated_coordinates(
+    values: tuple[float, float], expected_mean: float, expected_std: float
+) -> None:
+    """Rounding the raw mean must not inflate two-point population variance."""
+    fixture = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        fixture.case, fixture.model, horizon=1, samples=2, seed=7
+    )
+    members = tuple(
+        _copy_with_values(
+            member,
+            ({"x": value},),
+            trajectory_id=member.trajectory_id,
+        )
+        for member, value in zip(ensemble.trajectories, values, strict=True)
+    )
+    source = ensemble.model_copy(update={"trajectories": members, "summary": None})
+
+    point = analyze_trajectory_spread(
+        source, normalization_scales={"x": 1.0}
+    ).points[-1]
+
+    assert point.mean == expected_mean
+    assert point.population_std == expected_std
+    assert point.population_variance.kind == "finite"
+    assert point.population_variance.value == expected_std * expected_std
+
+
+@pytest.mark.parametrize(
+    ("kind", "raw_weights", "expected_policy"),
+    [
+        ("probability", (0.99, 0.01), "probability"),
+        ("relative_weight", (99.0, 1.0), "normalized_relative_weight"),
+    ],
+    ids=("probability", "relative"),
+)
+def test_spread_applies_and_retains_scenario_weight_policy(
+    kind: str,
+    raw_weights: tuple[float, float],
+    expected_policy: str,
+) -> None:
+    """Weighted population evidence must not silently become equal-member spread."""
+    fixture = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        fixture.case, fixture.model, horizon=1, samples=2, seed=7
+    )
+    members = tuple(
+        _copy_with_values(
+            member,
+            ({"x": value},),
+            trajectory_id=member.trajectory_id,
+            scenario_weight=ScenarioWeight(
+                kind=kind,
+                value=weight,
+                justification="known Task 11 weighted spread",
+            ),
+        )
+        for member, value, weight in zip(
+            ensemble.trajectories,
+            (0.0, 10.0),
+            raw_weights,
+            strict=True,
+        )
+    )
+    weighted = ensemble.model_copy(
+        update={"trajectories": members, "summary": None}
+    )
+
+    report = analyze_trajectory_spread(
+        weighted, normalization_scales={"x": 1.0}
+    )
+    point = report.points[-1]
+
+    assert report.weighting.policy == expected_policy
+    assert report.weighting.weights == pytest.approx((0.99, 0.01))
+    assert point.weighting_policy == expected_policy
+    assert point.weights == pytest.approx((0.99, 0.01))
+    assert point.values == (0.0, 10.0)
+    assert point.count == 2
+    assert point.mean == pytest.approx(0.1)
+    assert point.population_std == pytest.approx(math.sqrt(0.99))
+    assert point.population_variance.value == pytest.approx(0.99)
+
+
+def test_zero_weight_member_is_retained_but_excluded_from_weighted_support() -> None:
+    """A zero-weight member remains auditable without changing weighted spread."""
+    fixture = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        fixture.case, fixture.model, horizon=1, samples=2, seed=7
+    )
+    maximum = sys.float_info.max
+    members = tuple(
+        _copy_with_values(
+            member,
+            ({"x": value},),
+            trajectory_id=member.trajectory_id,
+            scenario_weight=ScenarioWeight(
+                kind="probability",
+                value=weight,
+                justification="zero-weight support regression",
+            ),
+        )
+        for member, value, weight in zip(
+            ensemble.trajectories,
+            (maximum, -maximum),
+            (1.0, 0.0),
+            strict=True,
+        )
+    )
+    weighted = ensemble.model_copy(
+        update={"trajectories": members, "summary": None}
+    )
+
+    point = analyze_trajectory_spread(
+        weighted, normalization_scales={"x": maximum}
+    ).points[-1]
+
+    assert point.values == (maximum, -maximum)
+    assert point.weights == (1.0, 0.0)
+    assert (point.mean, point.minimum, point.maximum) == (
+        maximum,
+        maximum,
+        maximum,
+    )
+    assert point.population_std == 0.0
+    assert point.spread_range.value == 0.0
+
+
+def test_maximum_relative_weights_normalize_before_weighted_extreme_spread() -> None:
+    """Finite relative weights and endpoints must not overflow intermediate sums."""
+    fixture = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        fixture.case, fixture.model, horizon=1, samples=2, seed=7
+    )
+    maximum = sys.float_info.max
+    members = tuple(
+        _copy_with_values(
+            member,
+            ({"x": value},),
+            trajectory_id=member.trajectory_id,
+            scenario_weight=ScenarioWeight(
+                kind="relative_weight",
+                value=maximum,
+                justification="equal maximum finite relative weights",
+            ),
+        )
+        for member, value in zip(
+            ensemble.trajectories, (-maximum, maximum), strict=True
+        )
+    )
+    weighted = ensemble.model_copy(
+        update={"trajectories": members, "summary": None}
+    )
+
+    point = analyze_trajectory_spread(
+        weighted, normalization_scales={"x": maximum}
+    ).points[-1]
+
+    assert point.weights == (0.5, 0.5)
+    assert point.mean == 0.0
+    assert point.population_std == maximum
+    assert point.population_variance.kind == "above_float_range"
+    assert point.spread_range.kind == "above_float_range"
+
+
+def test_positive_relative_weight_underflow_fails_closed() -> None:
+    """A positive declared member weight must not silently normalize to zero."""
+    fixture = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        fixture.case, fixture.model, horizon=1, samples=2, seed=7
+    )
+    members = tuple(
+        member.model_copy(
+            update={
+                "scenario_weight": ScenarioWeight(
+                    kind="relative_weight",
+                    value=weight,
+                    justification="positive normalization-underflow control",
+                )
+            }
+        )
+        for member, weight in zip(
+            ensemble.trajectories,
+            (sys.float_info.max, math.ulp(0.0)),
+            strict=True,
+        )
+    )
+    weighted = ensemble.model_copy(
+        update={"trajectories": members, "summary": None}
+    )
+
+    with pytest.raises(SpreadAnalysisError, match="weight.*representable"):
+        analyze_trajectory_spread(
+            weighted, normalization_scales={"x": 1.0}
+        )
+
+
+def test_spread_weighting_and_point_weights_reject_serialized_tampering() -> None:
+    """Copied weighting metadata must recompute from retained member weights."""
+    fixture = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        fixture.case, fixture.model, horizon=1, samples=2, seed=7
+    )
+    report = analyze_trajectory_spread(
+        ensemble, normalization_scales={"x": 1.0}
+    )
+
+    policy_payload = report.model_dump()
+    policy_payload["weighting"]["policy"] = "probability"
+    with pytest.raises(ValidationError, match="recompute from its source"):
+        SpreadAnalysis.model_validate(policy_payload)
+
+    point_payload = report.model_dump()
+    point_payload["points"][-1]["weights"] = (0.99, 0.01)
+    with pytest.raises(ValidationError, match="raw values|recompute from its source"):
+        SpreadAnalysis.model_validate(point_payload)
+
+
+@pytest.mark.parametrize(
+    ("paths", "expected_pattern", "expected_window_values"),
+    [
+        (
+            ((-4.0, -2.0, -1.0), (4.0, 2.0, 1.0)),
+            "strictly_contracting_spread",
+            (4.0, 2.0, 1.0),
+        ),
+        (
+            ((-2.0, -2.0, -2.0), (2.0, 2.0, 2.0)),
+            "constant_positive_spread",
+            (2.0, 2.0, 2.0),
+        ),
+    ],
+    ids=("contracting", "constant-positive"),
+)
+def test_spread_pattern_classifies_forecast_after_shared_initial_evidence(
+    paths: tuple[tuple[float, ...], tuple[float, ...]],
+    expected_pattern: str,
+    expected_window_values: tuple[float, ...],
+) -> None:
+    """A retained zero-spread initial state must not force a mixed trend label."""
+    fixture = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        fixture.case, fixture.model, horizon=3, samples=2, seed=7
+    )
+    members = tuple(
+        _copy_with_values(
+            member,
+            tuple({"x": value} for value in path),
+            trajectory_id=member.trajectory_id,
+        )
+        for member, path in zip(ensemble.trajectories, paths, strict=True)
+    )
+    source = ensemble.model_copy(update={"trajectories": members, "summary": None})
+
+    report = analyze_trajectory_spread(
+        source, normalization_scales={"x": 1.0}
+    )
+    pattern = report.patterns[0]
+
+    assert pattern.normalized_population_std == (
+        0.0,
+        *expected_window_values,
+    )
+    assert pattern.classified_normalized_population_std == expected_window_values
+    assert pattern.observed_pattern == expected_pattern
+    assert report.classification_window.basis == (
+        "forecast_after_shared_horizon_start"
+    )
+    assert report.classification_window.initial_evidence_source == (
+        "injected_initial_state"
+    )
+    assert report.classification_window.excluded_horizon_start is True
+    assert report.classification_window.start_point_index == 1
+    assert report.classification_window.classified_point_count == 3
+    assert report.classification_window.start_at == source.trajectories[0].points[0].at
+    assert report.classification_window.end_at == source.trajectories[0].points[-1].at
+
+
+def test_spread_classification_window_rejects_serialized_rebinding() -> None:
+    """A copied report cannot silently put shared initial evidence back in the trend."""
+    fixture = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        fixture.case, fixture.model, horizon=2, samples=2, seed=7
+    )
+    report = analyze_trajectory_spread(
+        ensemble, normalization_scales={"x": 1.0}
+    )
+    payload = report.model_dump()
+    payload["classification_window"]["start_point_index"] = 0
+    payload["classification_window"]["excluded_horizon_start"] = False
+
+    with pytest.raises(ValidationError, match="classification"):
+        SpreadAnalysis.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("start_at", "point_times"),
+    [
+        (
+            datetime(2026, 11, 1, 0, 30, tzinfo=ZoneInfo("America/New_York")),
+            (
+                datetime(
+                    2026,
+                    11,
+                    1,
+                    1,
+                    30,
+                    tzinfo=ZoneInfo("America/New_York"),
+                    fold=0,
+                ),
+                datetime(
+                    2026,
+                    11,
+                    1,
+                    1,
+                    30,
+                    tzinfo=ZoneInfo("America/New_York"),
+                    fold=1,
+                ),
+            ),
+        ),
+        (
+            datetime(1, 1, 1, 0, tzinfo=timezone(timedelta(hours=14))),
+            (datetime(1, 1, 1, 1, tzinfo=timezone(timedelta(hours=14))),),
+        ),
+        (
+            datetime(9999, 12, 31, 22, tzinfo=timezone(-timedelta(hours=12))),
+            (
+                datetime(
+                    9999,
+                    12,
+                    31,
+                    23,
+                    tzinfo=timezone(-timedelta(hours=12)),
+                ),
+            ),
+        ),
+    ],
+    ids=("same-cache-fold", "year-1-positive-offset", "year-9999-negative-offset"),
+)
+def test_analysis_orders_valid_boundary_instants_without_utc_construction(
+    start_at: datetime, point_times: tuple[datetime, ...]
+) -> None:
+    """Analysis alignment uses integer instant keys at DST and year boundaries."""
+    trajectory = _time_edge_trajectory(
+        trajectory_id="trajectory-time-edge",
+        start_at=start_at,
+        point_times=point_times,
+    )
+
+    report = analyze_trajectory_convergence(
+        trajectory, normalization_scales={"x": 1.0}
+    )
+
+    assert len(report.pairs) == len(point_times)
+    assert report.pairs[-1].to_at == point_times[-1]
+
+
+def test_spread_and_sensitivity_align_same_cached_zoneinfo_folds() -> None:
+    """All trajectory analyses share the same absolute-instant alignment rule."""
+    new_york = ZoneInfo("America/New_York")
+    start_at = datetime(2026, 11, 1, 0, 30, tzinfo=new_york)
+    point_times = (
+        datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=0),
+        datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=1),
+    )
+    baseline = _time_edge_trajectory(
+        trajectory_id="trajectory-fold-baseline",
+        start_at=start_at,
+        point_times=point_times,
+        point_values=(1.0, 2.0),
+    )
+    perturbed = _time_edge_trajectory(
+        trajectory_id="trajectory-fold-perturbed",
+        start_at=start_at,
+        point_times=point_times,
+        point_values=(2.0, 4.0),
+    )
+    ensemble = TrajectoryEnsemble(
+        ensemble_id="ensemble-fold",
+        model_id=baseline.model_id,
+        model_version=baseline.model_version,
+        case_id=baseline.case_id,
+        trajectories=(baseline, perturbed),
+        provenance=baseline.provenance,
+    )
+
+    spread = analyze_trajectory_spread(
+        ensemble, normalization_scales={"x": 1.0}
+    )
+    sensitivity = analyze_local_sensitivity(
+        baseline,
+        perturbations=(
+            ParameterPerturbation(
+                parameter_name="gain",
+                delta=1.0,
+                trajectory=perturbed,
+            ),
+        ),
+        normalization_scales={"x": 1.0},
+    )
+
+    assert [point.at.fold for point in spread.points if point.variable == "x"] == [
+        0,
+        0,
+        1,
+    ]
+    assert tuple(point.at.fold for point in sensitivity.point_slopes) == (0, 1)
+
+
+def test_all_analyses_wrap_deep_time_reversal_in_typed_errors() -> None:
+    """Construct-bypassed timeline corruption must never leak raw datetime errors."""
+    new_york = ZoneInfo("America/New_York")
+    start_at = datetime(2026, 11, 1, 0, 30, tzinfo=new_york)
+    first_fold = datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=0)
+    second_fold = datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=1)
+    valid = _time_edge_trajectory(
+        trajectory_id="trajectory-fold-valid",
+        start_at=start_at,
+        point_times=(first_fold, second_fold),
+    )
+    invalid = valid.model_copy(update={"points": tuple(reversed(valid.points))})
+
+    with pytest.raises(ConvergenceAnalysisError):
+        analyze_trajectory_convergence(invalid, normalization_scales={"x": 1.0})
+    with pytest.raises(SpreadAnalysisError):
+        analyze_trajectory_spread(invalid, normalization_scales={"x": 1.0})
+    with pytest.raises(LocalSensitivityError):
+        analyze_local_sensitivity(
+            invalid,
+            perturbations=(),
+            normalization_scales={"x": 1.0},
+        )
+
+
+def test_explicit_horizon_start_is_retained_once_and_excluded_from_label() -> None:
+    """An explicit initial sample is evidence, not a duplicate zero-duration step."""
+    start_at = datetime(2026, 8, 8, 12, tzinfo=UTC)
+    point_times = (start_at, start_at + timedelta(hours=1))
+    first = _time_edge_trajectory(
+        trajectory_id="trajectory-explicit-start-1",
+        start_at=start_at,
+        point_times=point_times,
+        point_values=(0.0, -2.0),
+    )
+    second = _time_edge_trajectory(
+        trajectory_id="trajectory-explicit-start-2",
+        start_at=start_at,
+        point_times=point_times,
+        point_values=(0.0, 2.0),
+    )
+    ensemble = TrajectoryEnsemble(
+        ensemble_id="ensemble-explicit-start",
+        model_id=first.model_id,
+        model_version=first.model_version,
+        case_id=first.case_id,
+        trajectories=(first, second),
+        provenance=first.provenance,
+    )
+
+    report = analyze_trajectory_spread(
+        ensemble, normalization_scales={"x": 1.0}
+    )
+
+    assert report.classification_window.initial_evidence_source == (
+        "explicit_horizon_start"
+    )
+    assert report.classification_window.classified_point_count == 1
+    assert report.patterns[0].normalized_population_std == (0.0, 2.0)
+    assert report.patterns[0].observed_pattern == "insufficient_spread_points"

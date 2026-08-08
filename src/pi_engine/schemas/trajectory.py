@@ -1,6 +1,6 @@
 """Immutable model-conditioned trajectory and ensemble records."""
 
-from datetime import UTC, datetime
+from datetime import datetime
 import math
 import sys
 from types import MappingProxyType
@@ -41,9 +41,36 @@ class _ImmutablePredictionSchema(BaseModel):
 
 
 def _require_timezone(value: datetime, field_name: str) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
+    try:
+        offset = value.utcoffset()
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{field_name} must include a valid timezone") from exc
+    if value.tzinfo is None or offset is None:
         raise ValueError(f"{field_name} must include a timezone")
     return value
+
+
+def _utc_instant_key(value: datetime) -> int:
+    """Return absolute microseconds without constructing an out-of-range UTC date."""
+    try:
+        offset = value.utcoffset()
+        if offset is None:
+            raise ValueError("datetime must include a timezone")
+        local_microseconds = (
+            (
+                ((value.toordinal() * 24 + value.hour) * 60 + value.minute) * 60
+                + value.second
+            )
+            * 1_000_000
+            + value.microsecond
+        )
+        offset_microseconds = (
+            (offset.days * 86_400 + offset.seconds) * 1_000_000
+            + offset.microseconds
+        )
+        return local_microseconds - offset_microseconds
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("datetime must define a valid absolute instant") from exc
 
 
 class TrajectoryHorizon(_ImmutablePredictionSchema):
@@ -62,7 +89,7 @@ class TrajectoryHorizon(_ImmutablePredictionSchema):
 
     @model_validator(mode="after")
     def end_must_follow_start(self) -> "TrajectoryHorizon":
-        if self.end_at <= self.start_at:
+        if _utc_instant_key(self.end_at) <= _utc_instant_key(self.start_at):
             raise ValueError("horizon end_at must be after start_at")
         return self
 
@@ -171,18 +198,19 @@ class Trajectory(_ImmutablePredictionSchema):
 
     @model_validator(mode="after")
     def validate_timeline(self) -> "Trajectory":
-        if self.initial_state.at.astimezone(UTC) != self.horizon.start_at.astimezone(
-            UTC
-        ):
+        start_key = _utc_instant_key(self.horizon.start_at)
+        end_key = _utc_instant_key(self.horizon.end_at)
+        if _utc_instant_key(self.initial_state.at) != start_key:
             raise ValueError("initial state time must match horizon start_at")
 
-        previous_at: datetime | None = None
+        previous_key: int | None = None
         for point in self.points:
-            if not self.horizon.start_at <= point.at <= self.horizon.end_at:
+            point_key = _utc_instant_key(point.at)
+            if not start_key <= point_key <= end_key:
                 raise ValueError("trajectory points must fall within the horizon")
-            if previous_at is not None and point.at <= previous_at:
+            if previous_key is not None and point_key <= previous_key:
                 raise ValueError("trajectory points must be strictly ordered")
-            previous_at = point.at
+            previous_key = point_key
         return self
 
 
@@ -284,7 +312,7 @@ def summarize_trajectories(
             if len(trajectory.points) != len(reference_points):
                 raise ValueError("trajectory samples must share point alignment")
             point = trajectory.points[point_index]
-            if point.at.astimezone(UTC) != reference_point.at.astimezone(UTC):
+            if _utc_instant_key(point.at) != _utc_instant_key(reference_point.at):
                 raise ValueError("trajectory samples must share time alignment")
             if set(point.values) != set(expected_variables):
                 raise ValueError("trajectory samples must share variable alignment")
@@ -439,9 +467,22 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
                 raise ValueError(
                     "trajectory ensemble member RNG scheme must match ensemble"
                 )
-            if trajectory.initial_state != expected_initial_state:
+            if (
+                _utc_instant_key(trajectory.initial_state.at)
+                != _utc_instant_key(expected_initial_state.at)
+                or trajectory.initial_state.observed != expected_initial_state.observed
+                or trajectory.initial_state.latent != expected_initial_state.latent
+                or trajectory.initial_state.uncertainty
+                != expected_initial_state.uncertainty
+                or trajectory.initial_state.boundary != expected_initial_state.boundary
+            ):
                 raise ValueError("trajectory ensemble members must share initial state")
-            if trajectory.horizon != expected_horizon:
+            if (
+                _utc_instant_key(trajectory.horizon.start_at)
+                != _utc_instant_key(expected_horizon.start_at)
+                or _utc_instant_key(trajectory.horizon.end_at)
+                != _utc_instant_key(expected_horizon.end_at)
+            ):
                 raise ValueError(
                     "trajectory ensemble members must share requested horizon"
                 )

@@ -27,6 +27,7 @@ from pi_engine.analysis.convergence import (
     _require_timezone,
     _utc,
 )
+from pi_engine.analysis._shared import finite_difference
 from pi_engine.schemas.common import FiniteFloat
 from pi_engine.schemas.trajectory import Trajectory
 
@@ -222,15 +223,12 @@ def _finite_division(numerator: float, denominator: float, role: str) -> float:
 
 
 def _signed_difference(left: float, right: float) -> float:
-    scale = max(abs(left), abs(right))
-    if scale == 0.0:
-        return 0.0
-    factor = (right / scale) - (left / scale)
-    if left != right and factor == 0.0:
-        raise LocalSensitivityError(
-            "raw sensitivity difference is not representable as finite"
-        )
-    return _finite_product(scale, factor, "raw sensitivity difference")
+    return finite_difference(
+        left,
+        right,
+        role="raw sensitivity difference",
+        error_type=LocalSensitivityError,
+    )
 
 
 def _slope_values(

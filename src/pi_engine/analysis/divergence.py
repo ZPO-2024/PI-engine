@@ -12,6 +12,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     ValidationError,
     field_validator,
@@ -29,6 +30,11 @@ from pi_engine.analysis.convergence import (
     _require_timezone,
     _utc,
 )
+from pi_engine.analysis._shared import (
+    normalize_nonnegative_weights,
+    normalized_absolute_difference,
+    translated_population_mean_std,
+)
 from pi_engine.schemas.common import FiniteFloat
 from pi_engine.schemas.trajectory import Trajectory, TrajectoryEnsemble
 
@@ -36,6 +42,12 @@ from pi_engine.schemas.trajectory import Trajectory, TrajectoryEnsemble
 NonEmptyString = Annotated[str, Field(min_length=1)]
 ComponentName = NonEmptyString | None
 SpreadSource = Trajectory | TrajectoryEnsemble
+SpreadWeightingPolicy = Literal[
+    "single_member",
+    "equal_member",
+    "probability",
+    "normalized_relative_weight",
+]
 
 
 class SpreadAnalysisError(ValueError):
@@ -51,6 +63,21 @@ class _ImmutableSpreadSchema(BaseModel):
     )
 
 
+class SpreadWeighting(_ImmutableSpreadSchema):
+    """Explicit normalized member weights in retained source order."""
+
+    policy: SpreadWeightingPolicy
+    weights: Annotated[tuple[FiniteFloat, ...], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def validate_weights(self) -> SpreadWeighting:
+        if any(item < 0.0 for item in self.weights) or not any(
+            item > 0.0 for item in self.weights
+        ):
+            raise ValueError("spread weights must be nonnegative with positive support")
+        return self
+
+
 class SpreadPoint(_ImmutableSpreadSchema):
     """Stable population evidence for one component at one UTC-aligned time."""
 
@@ -60,6 +87,8 @@ class SpreadPoint(_ImmutableSpreadSchema):
     normalization_scale: FiniteFloat = Field(gt=0.0)
     count: StrictInt = Field(ge=1)
     values: Annotated[tuple[FiniteFloat, ...], Field(min_length=1)]
+    weighting_policy: SpreadWeightingPolicy
+    weights: Annotated[tuple[FiniteFloat, ...], Field(min_length=1)]
     computation_scale: FiniteFloat = Field(ge=0.0)
     mean: FiniteFloat
     minimum: FiniteFloat
@@ -88,7 +117,11 @@ class SpreadPoint(_ImmutableSpreadSchema):
     def validate_statistics(self) -> SpreadPoint:
         if self.count != len(self.values):
             raise ValueError("spread count must match retained raw values")
-        expected = _spread_statistics(self.values, self.normalization_scale)
+        if len(self.weights) != self.count:
+            raise ValueError("spread weights must align with retained raw values")
+        expected = _spread_statistics(
+            self.values, self.weights, self.normalization_scale
+        )
         actual = (
             self.computation_scale,
             self.mean,
@@ -113,8 +146,54 @@ ObservedSpreadPattern = Literal[
     "strictly_expanding_spread",
     "strictly_contracting_spread",
     "constant_positive_spread",
+    "insufficient_spread_points",
     "mixed_spread",
 ]
+
+
+class SpreadClassificationWindow(_ImmutableSpreadSchema):
+    """Exact retained time window used for the mechanical spread label."""
+
+    basis: Literal[
+        "forecast_after_shared_horizon_start",
+        "all_retained_points",
+    ]
+    initial_evidence_source: Literal[
+        "injected_initial_state",
+        "explicit_horizon_start",
+        "none",
+    ]
+    excluded_horizon_start: StrictBool
+    start_point_index: StrictInt = Field(ge=0)
+    classified_point_count: StrictInt = Field(ge=1)
+    start_at: datetime
+    end_at: datetime
+
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def times_must_be_aware(cls, value: datetime) -> datetime:
+        return _require_timezone(value, "spread classification time")
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> SpreadClassificationWindow:
+        if self.excluded_horizon_start != (self.start_point_index == 1):
+            raise ValueError("spread classification exclusion metadata is inconsistent")
+        if self.basis == "forecast_after_shared_horizon_start":
+            if not self.excluded_horizon_start:
+                raise ValueError(
+                    "forecast spread classification must exclude horizon start"
+                )
+            if self.initial_evidence_source == "none":
+                raise ValueError(
+                    "forecast spread classification requires initial evidence"
+                )
+        elif self.excluded_horizon_start or self.initial_evidence_source != "none":
+            raise ValueError(
+                "all-point spread classification cannot exclude initial evidence"
+            )
+        if _utc(self.end_at, ValueError) < _utc(self.start_at, ValueError):
+            raise ValueError("spread classification window cannot run backward")
+        return self
 
 
 class ComponentSpreadPattern(_ImmutableSpreadSchema):
@@ -126,12 +205,26 @@ class ComponentSpreadPattern(_ImmutableSpreadSchema):
     normalized_population_std: Annotated[
         tuple[FiniteFloat, ...], Field(min_length=2)
     ]
+    classification_start_index: StrictInt = Field(ge=0)
+    classified_point_count: StrictInt = Field(ge=1)
+    classified_normalized_population_std: Annotated[
+        tuple[FiniteFloat, ...], Field(min_length=1)
+    ]
     observed_pattern: ObservedSpreadPattern
 
     @model_validator(mode="after")
     def validate_count(self) -> ComponentSpreadPattern:
         if self.point_count != len(self.normalized_population_std):
             raise ValueError("spread pattern count must match retained evidence")
+        if self.classification_start_index >= self.point_count:
+            raise ValueError("spread pattern classification start is out of bounds")
+        expected = self.normalized_population_std[self.classification_start_index :]
+        if self.classified_point_count != len(expected):
+            raise ValueError("spread classified count must match retained evidence")
+        if self.classified_normalized_population_std != expected:
+            raise ValueError(
+                "spread classified evidence must be an exact retained suffix"
+            )
         return self
 
 
@@ -146,6 +239,8 @@ class SpreadAnalysis(_ImmutableSpreadSchema):
         "ensemble",
     ]
     member_count: StrictInt = Field(ge=1)
+    weighting: SpreadWeighting
+    classification_window: SpreadClassificationWindow
     normalization: Annotated[
         tuple[VariableNormalization, ...], Field(min_length=1)
     ]
@@ -161,6 +256,24 @@ class SpreadAnalysis(_ImmutableSpreadSchema):
     @classmethod
     def revalidate_normalization(cls, value: object) -> object:
         return _revalidate_records(value, VariableNormalization)
+
+    @field_validator("weighting", mode="before")
+    @classmethod
+    def revalidate_weighting(cls, value: object) -> object:
+        if isinstance(value, SpreadWeighting):
+            return SpreadWeighting.model_validate(
+                value.model_dump(warnings=False)
+            )
+        return value
+
+    @field_validator("classification_window", mode="before")
+    @classmethod
+    def revalidate_classification_window(cls, value: object) -> object:
+        if isinstance(value, SpreadClassificationWindow):
+            return SpreadClassificationWindow.model_validate(
+                value.model_dump(warnings=False)
+            )
+        return value
 
     @field_validator("points", mode="before")
     @classmethod
@@ -178,8 +291,10 @@ class SpreadAnalysis(_ImmutableSpreadSchema):
         if (
             self.source_kind != expected[0]
             or self.member_count != expected[1]
-            or self.points != expected[2]
-            or self.patterns != expected[3]
+            or self.weighting != expected[2]
+            or self.classification_window != expected[3]
+            or self.points != expected[4]
+            or self.patterns != expected[5]
         ):
             raise ValueError("spread evidence must exactly recompute from its source")
         return self
@@ -204,7 +319,7 @@ def _revalidate_spread_source(
             ensemble = TrajectoryEnsemble.model_validate(
                 value.model_dump(warnings=False)
             )
-        except (TypeError, ValueError, ValidationError) as exc:
+        except (OverflowError, TypeError, ValueError, ValidationError) as exc:
             raise SpreadAnalysisError(
                 "source must be a valid TrajectoryEnsemble"
             ) from exc
@@ -227,7 +342,7 @@ def _revalidate_spread_source(
             return _revalidate_trajectory(
                 Trajectory.model_validate(value), SpreadAnalysisError
             )
-        except (TypeError, ValueError, ValidationError) as exc:
+        except (OverflowError, TypeError, ValueError, ValidationError) as exc:
             raise SpreadAnalysisError("spread source is not valid") from exc
     raise TypeError("source must be a Trajectory or TrajectoryEnsemble")
 
@@ -280,7 +395,9 @@ def _finite_ratio(numerator: float, denominator: float, role: str) -> float:
 
 
 def _spread_statistics(
-    values: tuple[float, ...], normalization_scale: float
+    values: tuple[float, ...],
+    weights: tuple[float, ...],
+    normalization_scale: float,
 ) -> tuple[
     float,
     float,
@@ -292,26 +409,10 @@ def _spread_statistics(
     float,
     float,
 ]:
-    computation_scale = max(abs(item) for item in values)
-    minimum = min(values)
-    maximum = max(values)
-    if computation_scale == 0.0:
-        mean = 0.0
-        std = 0.0
-    else:
-        normalized = tuple(item / computation_scale for item in values)
-        normalized_mean = math.fsum(normalized) / len(normalized)
-        mean = computation_scale * normalized_mean
-        normalized_variance = math.fsum(
-            (item - normalized_mean) ** 2 for item in normalized
-        ) / len(normalized)
-        std = computation_scale * math.sqrt(normalized_variance)
-        if normalized_variance != 0.0 and std == 0.0:
-            raise SpreadAnalysisError(
-                "population standard deviation is not representable as finite"
-            )
-    if not math.isfinite(mean) or not math.isfinite(std):
-        raise SpreadAnalysisError("spread mean or standard deviation is not finite")
+    mean, std, minimum, maximum = translated_population_mean_std(
+        values, weights, error_type=SpreadAnalysisError
+    )
+    computation_scale = max(abs(minimum), abs(maximum))
     spread_range = _absolute_difference(minimum, maximum)
     normalized_std = _finite_ratio(
         float(std), normalization_scale, "population standard deviation"
@@ -337,16 +438,13 @@ def _spread_statistics(
 def _finite_range_factor(
     minimum: float, maximum: float, normalization_scale: float
 ) -> float:
-    computation_scale = max(abs(minimum), abs(maximum))
-    if computation_scale == 0.0:
-        return 0.0
-    factor = abs(
-        (maximum / computation_scale) - (minimum / computation_scale)
+    return normalized_absolute_difference(
+        minimum,
+        maximum,
+        normalization_scale,
+        role="normalized range",
+        error_type=SpreadAnalysisError,
     )
-    ratio = computation_scale / normalization_scale
-    if factor != 0.0 and ratio > sys.float_info.max / factor:
-        raise SpreadAnalysisError("normalized range is not representable as finite")
-    return float(ratio * factor)
 
 
 def _spread_pattern(
@@ -360,6 +458,8 @@ def _spread_pattern(
         return "ensemble_singleton_no_spread"
     if all(item == 0.0 for item in values):
         return "ensemble_no_spread"
+    if len(values) < 2:
+        return "insufficient_spread_points"
     comparisons = tuple(
         (later > earlier) - (later < earlier)
         for earlier, later in zip(values, values[1:])
@@ -401,6 +501,30 @@ def _aligned_member_rows(
     return rows_by_member
 
 
+def _spread_weighting(source: SpreadSource) -> SpreadWeighting:
+    members = _members(source)
+    if isinstance(source, Trajectory):
+        return SpreadWeighting(policy="single_member", weights=(1.0,))
+    declared = tuple(member.scenario_weight for member in members)
+    if all(item is None for item in declared):
+        weights = normalize_nonnegative_weights(
+            tuple(1.0 for _ in members), error_type=SpreadAnalysisError
+        )
+        return SpreadWeighting(policy="equal_member", weights=weights)
+    if any(item is None for item in declared):
+        raise SpreadAnalysisError("ensemble weight scheme cannot be partial")
+    retained = tuple(item for item in declared if item is not None)
+    weights = normalize_nonnegative_weights(
+        tuple(item.value for item in retained), error_type=SpreadAnalysisError
+    )
+    policy: SpreadWeightingPolicy = (
+        "probability"
+        if retained[0].kind == "probability"
+        else "normalized_relative_weight"
+    )
+    return SpreadWeighting(policy=policy, weights=weights)
+
+
 def _derive_spread(
     source: SpreadSource,
     normalization: tuple[VariableNormalization, ...],
@@ -412,11 +536,14 @@ def _derive_spread(
         "ensemble",
     ],
     int,
+    SpreadWeighting,
+    SpreadClassificationWindow,
     tuple[SpreadPoint, ...],
     tuple[ComponentSpreadPattern, ...],
 ]:
     rows_by_member = _aligned_member_rows(source, normalization)
     kind = _source_kind(source)
+    weighting = _spread_weighting(source)
     scale_by_variable = {item.variable: item.scale for item in normalization}
     points: list[SpreadPoint] = []
     pattern_values: dict[tuple[str, str | None], list[float]] = {
@@ -429,7 +556,7 @@ def _derive_spread(
                 for rows in rows_by_member
             )
             scale = scale_by_variable[variable]
-            statistics = _spread_statistics(values, scale)
+            statistics = _spread_statistics(values, weighting.weights, scale)
             point = SpreadPoint(
                 at=at,
                 variable=variable,
@@ -437,6 +564,8 @@ def _derive_spread(
                 normalization_scale=scale,
                 count=len(values),
                 values=values,
+                weighting_policy=weighting.policy,
+                weights=weighting.weights,
                 computation_scale=statistics[0],
                 mean=statistics[1],
                 minimum=statistics[2],
@@ -451,17 +580,67 @@ def _derive_spread(
             pattern_values[(variable, component)].append(
                 point.normalized_population_std
             )
+    first_member = _members(source)[0]
+    first_source_at = first_member.points[0].at
+    horizon_start = first_member.horizon.start_at
+    has_retained_shared_initial = all(
+        values[0] == 0.0 for values in pattern_values.values()
+    )
+    if has_retained_shared_initial and len(rows_by_member[0]) > 1:
+        initial_evidence_source: Literal[
+            "injected_initial_state", "explicit_horizon_start", "none"
+        ] = (
+            "explicit_horizon_start"
+            if _utc(first_source_at, SpreadAnalysisError)
+            == _utc(horizon_start, SpreadAnalysisError)
+            else "injected_initial_state"
+        )
+        classification_start_index = 1
+        classification_window = SpreadClassificationWindow(
+            basis="forecast_after_shared_horizon_start",
+            initial_evidence_source=initial_evidence_source,
+            excluded_horizon_start=True,
+            start_point_index=classification_start_index,
+            classified_point_count=len(rows_by_member[0]) - 1,
+            start_at=rows_by_member[0][classification_start_index][0],
+            end_at=rows_by_member[0][-1][0],
+        )
+    else:
+        classification_start_index = 0
+        classification_window = SpreadClassificationWindow(
+            basis="all_retained_points",
+            initial_evidence_source="none",
+            excluded_horizon_start=False,
+            start_point_index=classification_start_index,
+            classified_point_count=len(rows_by_member[0]),
+            start_at=rows_by_member[0][0][0],
+            end_at=rows_by_member[0][-1][0],
+        )
     patterns = tuple(
         ComponentSpreadPattern(
             variable=variable,
             component=component,
             point_count=len(values),
             normalized_population_std=tuple(values),
-            observed_pattern=_spread_pattern(tuple(values), kind),
+            classification_start_index=classification_start_index,
+            classified_point_count=len(values) - classification_start_index,
+            classified_normalized_population_std=tuple(
+                values[classification_start_index:]
+            ),
+            observed_pattern=_spread_pattern(
+                tuple(values[classification_start_index:]), kind
+            ),
         )
         for (variable, component), values in pattern_values.items()
     )
-    return kind, len(rows_by_member), tuple(points), patterns
+    return (
+        kind,
+        len(rows_by_member),
+        weighting,
+        classification_window,
+        tuple(points),
+        patterns,
+    )
 
 
 def analyze_trajectory_spread(
@@ -479,11 +658,15 @@ def analyze_trajectory_spread(
         )
     except ConvergenceAnalysisError as exc:
         raise SpreadAnalysisError(str(exc)) from exc
-    kind, count, points, patterns = _derive_spread(validated, normalization)
+    kind, count, weighting, classification_window, points, patterns = _derive_spread(
+        validated, normalization
+    )
     return SpreadAnalysis(
         source=validated,
         source_kind=kind,
         member_count=count,
+        weighting=weighting,
+        classification_window=classification_window,
         normalization=normalization,
         points=points,
         patterns=patterns,
@@ -494,6 +677,8 @@ __all__ = [
     "ComponentSpreadPattern",
     "SpreadAnalysis",
     "SpreadAnalysisError",
+    "SpreadClassificationWindow",
     "SpreadPoint",
+    "SpreadWeighting",
     "analyze_trajectory_spread",
 ]
