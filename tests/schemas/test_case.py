@@ -364,6 +364,19 @@ def test_system_graph_metadata_cannot_be_mutated_after_validation(
         getattr(graph, metadata_field)["kind"] = "mutated"
 
 
+@pytest.mark.parametrize("metadata_field", ["geometry_metadata", "topology_metadata"])
+def test_system_graph_omitted_metadata_defaults_are_immutable_and_round_trip(
+    metadata_field: str,
+) -> None:
+    """Skipping default validation would expose mutable graph metadata maps."""
+    graph = SystemGraph(nodes=(), edges=())
+
+    with pytest.raises(TypeError):
+        getattr(graph, metadata_field)["kind"] = "mutated"
+
+    assert SystemGraph.model_validate_json(graph.model_dump_json()) == graph
+
+
 def test_system_graph_rejects_boundary_relationship_with_unknown_node() -> None:
     """A boundary relationship pointing outside the node set would be unresolved."""
     with pytest.raises(ValidationError, match="unknown node"):

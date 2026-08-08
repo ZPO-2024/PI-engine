@@ -55,8 +55,12 @@ class SystemGraph(BaseModel):
     nodes: tuple[GraphNode, ...]
     edges: tuple[GraphEdge, ...]
     boundary_relationships: tuple[BoundaryRelationship, ...] = ()
-    geometry_metadata: Mapping[str, JsonScalar] = Field(default_factory=dict)
-    topology_metadata: Mapping[str, JsonScalar] = Field(default_factory=dict)
+    geometry_metadata: Mapping[str, JsonScalar] = Field(
+        default_factory=dict, validate_default=True
+    )
+    topology_metadata: Mapping[str, JsonScalar] = Field(
+        default_factory=dict, validate_default=True
+    )
 
     @field_validator("geometry_metadata", "topology_metadata")
     @classmethod
