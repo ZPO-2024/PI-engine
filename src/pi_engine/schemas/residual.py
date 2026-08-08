@@ -1,5 +1,6 @@
 """First-class forecast residual records with provisional classifications."""
 
+from datetime import datetime
 from enum import Enum
 from typing import Annotated, Literal
 
@@ -45,6 +46,8 @@ class Residual(_ImmutableResidualSchema):
     """A prediction/outcome difference retained as auditable data."""
 
     residual_id: NonEmptyString
+    trajectory_id: NonEmptyString
+    prediction_time: datetime
     model_id: NonEmptyString
     model_version: NonEmptyString
     case_id: NonEmptyString
@@ -59,6 +62,15 @@ class Residual(_ImmutableResidualSchema):
     ]
     classification: ResidualClassification
     provenance: Provenance
+
+    @field_validator("prediction_time")
+    @classmethod
+    def prediction_time_must_be_timezone_aware(
+        cls, value: datetime
+    ) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("prediction_time must include a timezone")
+        return value
 
     @field_validator("observed_outcome", mode="before")
     @classmethod
@@ -94,4 +106,33 @@ class Residual(_ImmutableResidualSchema):
         residual_identity = (self.case_id, self.variable, self.unit)
         if observed_identity != residual_identity:
             raise ValueError("observed outcome identity must match residual identity")
+
+        observed_value = self.observed_outcome.value
+        if not _is_numeric_value(observed_value):
+            raise ValueError(
+                "observed outcome value must be a finite numeric scalar or vector"
+            )
+
+        observed_shape = _numeric_shape(observed_value)
+        if _numeric_shape(self.error) != observed_shape:
+            raise ValueError("observed outcome and error must have compatible shapes")
+        if (
+            self.predicted_value is not None
+            and _numeric_shape(self.predicted_value) != observed_shape
+        ):
+            raise ValueError(
+                "predicted value, observed outcome, and error must have compatible shapes"
+            )
         return self
+
+
+def _is_numeric_value(value: object) -> bool:
+    return isinstance(value, tuple) or (
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+    )
+
+
+def _numeric_shape(value: object) -> tuple[int, ...]:
+    if isinstance(value, tuple):
+        return (len(value),)
+    return ()

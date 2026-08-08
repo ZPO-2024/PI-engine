@@ -18,6 +18,8 @@ from pi_engine.schemas.state import StateEstimate
 
 
 NonEmptyString = Annotated[str, Field(min_length=1)]
+# Accept no more than one part per billion of floating-point summation drift.
+PROBABILITY_SUM_TOLERANCE = 1e-9
 
 
 class _ImmutablePredictionSchema(BaseModel):
@@ -199,6 +201,8 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
     @model_validator(mode="after")
     def validate_member_identity(self) -> "TrajectoryEnsemble":
         expected = (self.model_id, self.model_version, self.case_id)
+        expected_initial_state = self.trajectories[0].initial_state
+        expected_horizon = self.trajectories[0].horizon
         for trajectory in self.trajectories:
             actual = (
                 trajectory.model_id,
@@ -207,4 +211,29 @@ class TrajectoryEnsemble(_ImmutablePredictionSchema):
             )
             if actual != expected:
                 raise ValueError("trajectory ensemble member identity must match ensemble")
+            if trajectory.initial_state != expected_initial_state:
+                raise ValueError("trajectory ensemble members must share initial state")
+            if trajectory.horizon != expected_horizon:
+                raise ValueError("trajectory ensemble members must share requested horizon")
+
+        weights = [trajectory.scenario_weight for trajectory in self.trajectories]
+        if all(weight is None for weight in weights):
+            return self
+        if any(weight is None for weight in weights):
+            raise ValueError("trajectory ensemble weight scheme cannot be partial")
+
+        declared_weights = [weight for weight in weights if weight is not None]
+        kinds = {weight.kind for weight in declared_weights}
+        if len(kinds) != 1:
+            raise ValueError("trajectory ensemble weight scheme cannot mix kinds")
+
+        total = sum(weight.value for weight in declared_weights)
+        kind = declared_weights[0].kind
+        if kind == "probability" and abs(total - 1.0) > PROBABILITY_SUM_TOLERANCE:
+            raise ValueError(
+                "trajectory ensemble probability weights must sum to 1 "
+                f"within {PROBABILITY_SUM_TOLERANCE}"
+            )
+        if kind == "relative_weight" and total <= 0.0:
+            raise ValueError("trajectory ensemble relative weights need a positive total")
         return self

@@ -81,3 +81,15 @@ class Outcome(_ImmutableOutcomeSchema):
         if isinstance(value, Provenance):
             return Provenance.model_validate(value.model_dump())
         return value
+
+    @model_validator(mode="after")
+    def validate_chronology(self) -> "Outcome":
+        if self.available_at < self.event_time:
+            raise ValueError("available_at must not precede event_time")
+        if self.comparison_window is not None and not (
+            self.comparison_window.start_at
+            <= self.event_time
+            <= self.comparison_window.end_at
+        ):
+            raise ValueError("comparison window must contain event_time")
+        return self

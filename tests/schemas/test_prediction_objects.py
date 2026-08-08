@@ -84,6 +84,8 @@ def outcome_payload(**overrides: object) -> dict[str, object]:
 def residual_payload(**overrides: object) -> dict[str, object]:
     values: dict[str, object] = {
         "residual_id": "residual-flow-1",
+        "trajectory_id": "trajectory-river-1",
+        "prediction_time": END,
         "model_id": "river-linear-decay",
         "model_version": "1.2.0",
         "case_id": "case-river-1",
@@ -262,6 +264,212 @@ def test_trajectory_ensemble_rejects_mixed_model_or_case_identity() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "weights",
+    [
+        (
+            ScenarioWeight(
+                kind="probability",
+                value=0.6,
+                justification="normalized model branch probability",
+            ),
+            None,
+        ),
+        (
+            ScenarioWeight(
+                kind="probability",
+                value=0.6,
+                justification="normalized model branch probability",
+            ),
+            ScenarioWeight(
+                kind="relative_weight",
+                value=0.4,
+                justification="unnormalized sampling weight",
+            ),
+        ),
+        (
+            ScenarioWeight(
+                kind="probability",
+                value=0.6,
+                justification="normalized model branch probability",
+            ),
+            ScenarioWeight(
+                kind="probability",
+                value=0.3,
+                justification="normalized model branch probability",
+            ),
+        ),
+        (
+            ScenarioWeight(
+                kind="relative_weight",
+                value=0.0,
+                justification="unnormalized sampling weight",
+            ),
+            ScenarioWeight(
+                kind="relative_weight",
+                value=0.0,
+                justification="unnormalized sampling weight",
+            ),
+        ),
+    ],
+    ids=("partial", "mixed", "probability-total", "zero-relative-total"),
+)
+def test_trajectory_ensemble_rejects_incoherent_weight_scheme(
+    weights: tuple[ScenarioWeight | None, ScenarioWeight | None],
+) -> None:
+    """Partial, mixed, unnormalized, or zero-total weights are not one ensemble."""
+    trajectories = tuple(
+        Trajectory.model_validate(
+            trajectory_payload(
+                trajectory_id=f"trajectory-river-{index}",
+                scenario_weight=weight,
+            )
+        )
+        for index, weight in enumerate(weights, start=1)
+    )
+
+    with pytest.raises(ValidationError, match="weight"):
+        TrajectoryEnsemble(
+            ensemble_id="ensemble-river-1",
+            model_id="river-linear-decay",
+            model_version="1.2.0",
+            case_id="case-river-1",
+            trajectories=trajectories,
+            seed=9173,
+            provenance=provenance("PI-engine stochastic runner"),
+        )
+
+
+@pytest.mark.parametrize("weight_kind", [None, "probability", "relative_weight"])
+def test_trajectory_ensemble_accepts_each_coherent_weight_scheme(
+    weight_kind: str | None,
+) -> None:
+    """An ensemble may be unweighted, probabilistic, or relatively weighted."""
+    values = (0.4, 0.6) if weight_kind == "probability" else (2.0, 3.0)
+    weights = (
+        (None, None)
+        if weight_kind is None
+        else tuple(
+            ScenarioWeight(
+                kind=weight_kind,
+                value=value,
+                justification="declared model sampling scheme",
+            )
+            for value in values
+        )
+    )
+    trajectories = tuple(
+        Trajectory.model_validate(
+            trajectory_payload(
+                trajectory_id=f"trajectory-river-{index}",
+                scenario_weight=weight,
+            )
+        )
+        for index, weight in enumerate(weights, start=1)
+    )
+
+    ensemble = TrajectoryEnsemble(
+        ensemble_id="ensemble-river-1",
+        model_id="river-linear-decay",
+        model_version="1.2.0",
+        case_id="case-river-1",
+        trajectories=trajectories,
+        seed=9173,
+        provenance=provenance("PI-engine stochastic runner"),
+    )
+
+    assert ensemble.trajectories == trajectories
+
+
+def test_trajectory_ensemble_accepts_probability_roundoff_within_tolerance() -> None:
+    """Ordinary floating-point roundoff must not invalidate normalized weights."""
+    weights = (0.6, 0.4000000005)
+    trajectories = tuple(
+        Trajectory.model_validate(
+            trajectory_payload(
+                trajectory_id=f"trajectory-river-{index}",
+                scenario_weight=ScenarioWeight(
+                    kind="probability",
+                    value=value,
+                    justification="normalized model branch probability",
+                ),
+            )
+        )
+        for index, value in enumerate(weights, start=1)
+    )
+
+    ensemble = TrajectoryEnsemble(
+        ensemble_id="ensemble-river-1",
+        model_id="river-linear-decay",
+        model_version="1.2.0",
+        case_id="case-river-1",
+        trajectories=trajectories,
+        seed=9173,
+        provenance=provenance("PI-engine stochastic runner"),
+    )
+
+    assert ensemble.trajectories == trajectories
+
+
+def test_trajectory_ensemble_members_share_initial_state() -> None:
+    """Samples conditioned on different initial states cannot share an ensemble."""
+    baseline = Trajectory.model_validate(
+        trajectory_payload(scenario_weight=None)
+    )
+    changed = Trajectory.model_validate(
+        trajectory_payload(
+            trajectory_id="trajectory-river-2",
+            scenario_weight=None,
+            initial_state=StateEstimate(
+                at=START,
+                observed={"flow": 13.0},
+                latent={"rainfall": 2.0},
+                uncertainty={"flow": 0.4},
+                boundary={"rainfall": 2.0},
+            ),
+        )
+    )
+
+    with pytest.raises(ValidationError, match="initial state"):
+        TrajectoryEnsemble(
+            ensemble_id="ensemble-river-1",
+            model_id="river-linear-decay",
+            model_version="1.2.0",
+            case_id="case-river-1",
+            trajectories=(baseline, changed),
+            seed=9173,
+            provenance=provenance("PI-engine stochastic runner"),
+        )
+
+
+def test_trajectory_ensemble_members_share_requested_horizon() -> None:
+    """Samples over different requested horizons cannot share an ensemble."""
+    baseline = Trajectory.model_validate(
+        trajectory_payload(scenario_weight=None)
+    )
+    changed = Trajectory.model_validate(
+        trajectory_payload(
+            trajectory_id="trajectory-river-2",
+            scenario_weight=None,
+            horizon=TrajectoryHorizon(
+                start_at=START,
+                end_at=END + timedelta(hours=1),
+            ),
+        )
+    )
+
+    with pytest.raises(ValidationError, match="horizon"):
+        TrajectoryEnsemble(
+            ensemble_id="ensemble-river-1",
+            model_id="river-linear-decay",
+            model_version="1.2.0",
+            case_id="case-river-1",
+            trajectories=(baseline, changed),
+            seed=9173,
+            provenance=provenance("PI-engine stochastic runner"),
+        )
+
+
 def test_outcome_round_trip_preserves_withheld_value_timing_window_and_source() -> None:
     """Losing withheld timing, units, or source makes forecast comparison unauditable."""
     outcome = Outcome.model_validate(outcome_payload())
@@ -294,6 +502,27 @@ def test_outcome_allows_point_comparison_without_fabricated_window() -> None:
     assert outcome.comparison_window is None
 
 
+def test_outcome_rejects_availability_before_the_event() -> None:
+    """An outcome cannot be available before the event it records occurs."""
+    with pytest.raises(ValidationError, match="available_at"):
+        Outcome.model_validate(
+            outcome_payload(available_at=END - timedelta(seconds=1))
+        )
+
+
+def test_outcome_comparison_window_must_contain_event_time() -> None:
+    """A comparison interval excluding its outcome event compares the wrong period."""
+    with pytest.raises(ValidationError, match="contain event_time"):
+        Outcome.model_validate(
+            outcome_payload(
+                comparison_window=ComparisonWindow(
+                    start_at=END + timedelta(minutes=1),
+                    end_at=END + timedelta(minutes=30),
+                )
+            )
+        )
+
+
 @pytest.mark.parametrize("field", ["event_time", "available_at"])
 def test_outcome_requires_timezone_aware_timing(field: str) -> None:
     """Naive held-out times make cutoff and comparison ordering ambiguous."""
@@ -310,6 +539,18 @@ def test_outcome_rejects_nonfinite_values_and_nested_validation_bypass() -> None
     with pytest.raises(ValidationError):
         Outcome.model_validate(
             outcome_payload(value=float("inf"), provenance=invalid_provenance)
+        )
+
+
+def test_residual_rejects_nonnumeric_observed_outcome_value() -> None:
+    """A numeric residual cannot embed a categorical observed outcome."""
+    categorical_outcome = Outcome.model_validate(
+        outcome_payload(value="high flow")
+    )
+
+    with pytest.raises(ValidationError, match="finite numeric scalar or vector"):
+        Residual.model_validate(
+            residual_payload(observed_outcome=categorical_outcome)
         )
 
 
@@ -345,6 +586,37 @@ def test_residual_round_trip_preserves_each_distinct_provisional_category(
     assert Residual.model_validate_json(residual.model_dump_json()) == residual
 
 
+def test_residual_round_trip_preserves_trajectory_point_trace() -> None:
+    """A residual must retain the trajectory and prediction time it evaluates."""
+    residual = Residual.model_validate(residual_payload())
+    dumped = residual.model_dump(mode="json")
+
+    assert dumped["trajectory_id"] == "trajectory-river-1"
+    assert dumped["prediction_time"] == "2026-08-08T18:00:00Z"
+    assert Residual.model_validate_json(residual.model_dump_json()) == residual
+
+
+@pytest.mark.parametrize("field", ["trajectory_id", "prediction_time"])
+def test_residual_requires_prediction_trace_fields(field: str) -> None:
+    """Omitting either trace coordinate would leave the residual unanchored."""
+    payload = residual_payload()
+    del payload[field]
+
+    with pytest.raises(ValidationError) as exc_info:
+        Residual.model_validate(payload)
+
+    assert exc_info.value.errors()[0]["loc"] == (field,)
+    assert exc_info.value.errors()[0]["type"] == "missing"
+
+
+def test_residual_requires_timezone_aware_prediction_time() -> None:
+    """A naive point time cannot durably identify a trajectory coordinate."""
+    with pytest.raises(ValidationError, match="prediction_time"):
+        Residual.model_validate(
+            residual_payload(prediction_time=datetime(2026, 8, 8, 18, 0))
+        )
+
+
 def test_residual_requires_explicit_classification_instead_of_defaulting_to_noise() -> None:
     """An unexplained residual must never be silently classified as process noise."""
     payload = residual_payload()
@@ -376,6 +648,53 @@ def test_residual_requires_a_predicted_value_or_distribution_reference() -> None
         Residual.model_validate(
             residual_payload(predicted_value=None, predicted_distribution_ref=None)
         )
+
+
+@pytest.mark.parametrize(
+    ("predicted_value", "observed_value", "error"),
+    [
+        (8.25, (8.0, 9.0), 0.25),
+        ((8.25, 9.25), (8.0, 9.0), 0.25),
+        ((8.25, 9.25), (8.0,), (0.25, 0.25)),
+    ],
+    ids=("scalar-vector", "vector-error-scalar", "vector-length"),
+)
+def test_residual_rejects_incompatible_numeric_shapes(
+    predicted_value: object,
+    observed_value: object,
+    error: object,
+) -> None:
+    """Prediction, observation, and error must describe the same numeric shape."""
+    observed_outcome = Outcome.model_validate(
+        outcome_payload(value=observed_value)
+    )
+
+    with pytest.raises(ValidationError, match="shape"):
+        Residual.model_validate(
+            residual_payload(
+                predicted_value=predicted_value,
+                observed_outcome=observed_outcome,
+                error=error,
+            )
+        )
+
+
+def test_residual_accepts_compatible_numeric_vectors() -> None:
+    """Vector forecasts retain componentwise observed values and errors."""
+    observed_outcome = Outcome.model_validate(
+        outcome_payload(value=(8.0, 9.0))
+    )
+    residual = Residual.model_validate(
+        residual_payload(
+            predicted_value=(8.25, 9.1),
+            observed_outcome=observed_outcome,
+            error=(0.25, 0.1),
+        )
+    )
+
+    assert residual.predicted_value == (8.25, 9.1)
+    assert residual.observed_outcome.value == (8.0, 9.0)
+    assert residual.error == (0.25, 0.1)
 
 
 def test_residual_rejects_outcome_identity_mismatch() -> None:
