@@ -1,6 +1,6 @@
 """Withheld outcome records revealed only for post-prediction evaluation."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -42,7 +42,7 @@ class ComparisonWindow(_ImmutableOutcomeSchema):
 
     @model_validator(mode="after")
     def end_must_not_precede_start(self) -> "ComparisonWindow":
-        if self.end_at < self.start_at:
+        if self.end_at.astimezone(UTC) < self.start_at.astimezone(UTC):
             raise ValueError("comparison window end_at must not precede start_at")
         return self
 
@@ -84,12 +84,14 @@ class Outcome(_ImmutableOutcomeSchema):
 
     @model_validator(mode="after")
     def validate_chronology(self) -> "Outcome":
-        if self.available_at < self.event_time:
+        event_time = self.event_time.astimezone(UTC)
+        available_at = self.available_at.astimezone(UTC)
+        if available_at < event_time:
             raise ValueError("available_at must not precede event_time")
         if self.comparison_window is not None and not (
-            self.comparison_window.start_at
-            <= self.event_time
-            <= self.comparison_window.end_at
+            self.comparison_window.start_at.astimezone(UTC)
+            <= event_time
+            <= self.comparison_window.end_at.astimezone(UTC)
         ):
             raise ValueError("comparison window must contain event_time")
         return self
