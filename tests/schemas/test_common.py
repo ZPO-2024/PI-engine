@@ -12,10 +12,11 @@ from pi_engine.schemas.common import (
 )
 
 
-def test_confidence_rejects_scores_outside_probability_bounds() -> None:
+@pytest.mark.parametrize("score", [-0.01, 1.01])
+def test_confidence_rejects_scores_outside_probability_bounds(score: float) -> None:
     """A missing 0..1 bound would permit invalid confidence claims."""
     with pytest.raises(ValidationError):
-        Confidence(score=1.01)
+        Confidence(score=score)
 
 
 def test_provenance_serializes_its_source_and_observation_time() -> None:
@@ -31,6 +32,15 @@ def test_provenance_serializes_its_source_and_observation_time() -> None:
         "observed_at": "2026-08-08T12:30:00Z",
         "reference": "https://waterdata.usgs.gov/monitoring-location/04249000/",
     }
+
+
+def test_provenance_rejects_a_naive_observation_time() -> None:
+    """Accepting a naïve time would make prediction-cutoff comparisons ambiguous."""
+    with pytest.raises(ValidationError):
+        Provenance(
+            source="USGS stream gauge 04249000",
+            observed_at=datetime(2026, 8, 8, 12, 30),
+        )
 
 
 def test_shared_enums_serialize_canonical_values() -> None:

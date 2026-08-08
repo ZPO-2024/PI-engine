@@ -3,7 +3,7 @@
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class UncertaintyClass(str, Enum):
@@ -49,3 +49,10 @@ class Provenance(BaseModel):
     source: str = Field(min_length=1)
     observed_at: datetime
     reference: str | None = None
+
+    @field_validator("observed_at")
+    @classmethod
+    def observed_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("observed_at must include a timezone")
+        return value
