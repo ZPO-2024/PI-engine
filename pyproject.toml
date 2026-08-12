@@ -13,6 +13,9 @@ dependencies = [
     "tzdata>=2025.2",
 ]
 
+[project.scripts]
+pi-engine = "pi_engine.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 namespaces = true
