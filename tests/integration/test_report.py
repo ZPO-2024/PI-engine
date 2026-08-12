@@ -16,7 +16,37 @@ from pi_engine.schemas.residual import (
     ResidualClassification,
 )
 from pi_engine.simulation.runner import simulate_deterministic
-from pi_engine.synthetic.systems import deterministic_divergence, linear_convergence
+from pi_engine.simulation.stochastic import simulate_stochastic
+from pi_engine.synthetic.systems import (
+    deterministic_divergence,
+    hierarchical_nested_dynamics,
+    linear_convergence,
+    stochastic_branching,
+)
+
+
+def _report_provenance(reference: str) -> Provenance:
+    return Provenance(
+        source="report integration fixture",
+        observed_at=linear_convergence().case.prediction_cutoff,
+        reference=reference,
+    )
+
+
+def _state_confidence_assessment(score: float = 0.8) -> dict[str, object]:
+    return {
+        "confidence": Confidence(
+            score=score, basis="three direct measurements at the cutoff"
+        ),
+        "provenance": _report_provenance("report:state-confidence"),
+    }
+
+
+def _observability_warning(message: str) -> dict[str, object]:
+    return {
+        "message": message,
+        "provenance": _report_provenance("report:observability-warning"),
+    }
 
 
 def _residual_for_linear_forecast(trajectory: object) -> object:
@@ -60,9 +90,8 @@ def _linear_report_inputs() -> dict[str, object]:
     alternate = deterministic_divergence().model
     return {
         "case": fixture.case,
-        "state_confidence": Confidence(
-            score=0.8, basis="three direct measurements at the cutoff"
-        ),
+        "provenance": _report_provenance("report:linear"),
+        "state_confidence": _state_confidence_assessment(),
         "models": (fixture.model, alternate),
         "applicability": (
             ApplicabilityResult(
@@ -104,7 +133,7 @@ def _linear_report_inputs() -> dict[str, object]:
         ),
         "residuals": (_residual_for_linear_forecast(trajectory),),
         "observability_warnings": (
-            "latent state is not directly observed",
+            _observability_warning("latent state is not directly observed"),
         ),
     }
 
@@ -122,9 +151,17 @@ def test_report_retains_separate_models_and_analysis_artifacts() -> None:
     text = render_prediction_report(report)
 
     assert structured["case"]["case_id"] == "synthetic-linear-convergence"
+    assert structured["provenance"]["reference"] == "report:linear"
     assert structured["state_confidence"] == {
-        "score": 0.8,
-        "basis": "three direct measurements at the cutoff",
+        "confidence": {
+            "score": 0.8,
+            "basis": "three direct measurements at the cutoff",
+        },
+        "provenance": {
+            "source": "report integration fixture",
+            "observed_at": "2026-08-08T12:00:00Z",
+            "reference": "report:state-confidence",
+        },
     }
     assert [item["applicable"] for item in structured["applicability"]] == [
         True,
@@ -148,6 +185,9 @@ def test_report_retains_separate_models_and_analysis_artifacts() -> None:
         "structured_unknown"
     )
     assert structured["held_out_scores"] is None
+    assert structured["observability_warnings"][0]["provenance"]["reference"] == (
+        "report:observability-warning"
+    )
     assert "Model applicability:" in text
     assert "synthetic-linear-affine-convergence@1.0.0: applicable" in text
     assert "synthetic competing-model rejection" in text
@@ -170,9 +210,13 @@ def test_report_marks_a_case_unidentifiable_when_no_model_is_applicable() -> Non
     fixture = linear_convergence()
     report = build_prediction_report(
         case=fixture.case,
-        state_confidence=Confidence(
-            score=0.0, basis="no applicable model supports a forecast"
-        ),
+        provenance=_report_provenance("report:unidentifiable"),
+        state_confidence={
+            "confidence": Confidence(
+                score=0.0, basis="no applicable model supports a forecast"
+            ),
+            "provenance": _report_provenance("report:unidentifiable-confidence"),
+        },
         models=(fixture.model,),
         applicability=(
             ApplicabilityResult(
@@ -186,7 +230,9 @@ def test_report_marks_a_case_unidentifiable_when_no_model_is_applicable() -> Non
                 rejection_causes=("required variable unavailable",),
             ),
         ),
-        observability_warnings=("x is unavailable at the cutoff",),
+        observability_warnings=(
+            _observability_warning("x is unavailable at the cutoff"),
+        ),
     )
 
     assert report.identifiability == UNIDENTIFIABLE_FROM_AVAILABLE_EVIDENCE
@@ -242,3 +288,150 @@ def test_report_rejects_scores_for_a_same_id_but_changed_trajectory() -> None:
 
     with pytest.raises(ValueError, match="exact report trajectory artifacts"):
         build_prediction_report(**inputs, held_out_scores=scores)
+
+
+def test_report_renders_canonical_state_and_graph_relationship_views() -> None:
+    """Removing canonical variable or graph relations must make this view fail."""
+    from pi_engine.reporting.report import (
+        build_prediction_report,
+        render_prediction_report,
+    )
+
+    fixture = hierarchical_nested_dynamics()
+    report = build_prediction_report(
+        case=fixture.case,
+        provenance=_report_provenance("report:hierarchy"),
+        state_confidence=_state_confidence_assessment(),
+        models=(fixture.model,),
+        applicability=(
+            ApplicabilityResult(
+                model_id=fixture.model.model_id,
+                model_version=fixture.model.version,
+                applicable=True,
+                structural_score=0,
+                structural_score_max=0,
+                rank=1,
+                reasons=("hierarchical fixture applies",),
+                rejection_causes=(),
+            ),
+        ),
+        observability_warnings=(),
+    )
+
+    text = render_prediction_report(report)
+
+    assert "Canonical state-space:" in text
+    assert "levels [a.u.]: observed=(1.0, 0.0, 0.0)" in text
+    assert "Graph nodes:" in text
+    assert "root: variables=levels" in text
+    assert "Graph relationships:" in text
+    assert "root -> middle: coupling_type=parent_to_child; strength=0.5" in text
+
+
+def test_report_renders_all_revealed_score_metric_classes() -> None:
+    """Dropping any retained score class from text must fail these real reports."""
+    from pi_engine.reporting.report import (
+        build_prediction_report,
+        render_prediction_report,
+    )
+
+    linear = linear_convergence()
+    binary_prediction = simulate_deterministic(
+        linear.case, linear.model, horizon=3
+    ).model_copy(
+        update={
+            "points": tuple(
+                point.model_copy(update={"values": {"x": value}})
+                for point, value in zip(
+                    simulate_deterministic(linear.case, linear.model, horizon=3).points,
+                    (0.2, 0.8, 0.6),
+                    strict=True,
+                )
+            )
+        }
+    )
+    binary_outcomes = tuple(
+        outcome.model_copy(update={"value": value})
+        for outcome, value in zip(linear.outcomes, (0.0, 1.0, 1.0), strict=True)
+    )
+    binary_scores = score_revealed_evaluation(
+        reveal_holdout(prepare_holdout(linear.case, binary_outcomes), binary_prediction),
+        (binary_prediction,),
+        binary_probability_variables=("x",),
+        include_log_score=True,
+    )
+    binary_inputs = _linear_report_inputs()
+    binary_inputs["trajectories"] = (binary_prediction,)
+    binary_text = render_prediction_report(
+        build_prediction_report(**binary_inputs, held_out_scores=binary_scores)
+    )
+
+    assert "brier_score=" in binary_text
+    assert "log_score=" in binary_text
+    assert "mean_brier_score=" in binary_text
+    assert "mean_log_score=" in binary_text
+
+    branching = stochastic_branching(seed=7)
+    ensemble = simulate_stochastic(
+        branching.case, branching.model, horizon=4, samples=4, seed=7
+    )
+    interval_scores = score_revealed_evaluation(
+        reveal_holdout(prepare_holdout(branching.case, branching.outcomes), ensemble),
+        (ensemble,),
+        interval_levels=(0.5,),
+    )
+    interval_text = render_prediction_report(
+        build_prediction_report(
+            case=branching.case,
+            provenance=_report_provenance("report:interval-scores"),
+            state_confidence=_state_confidence_assessment(),
+            models=(branching.model,),
+            applicability=(
+                ApplicabilityResult(
+                    model_id=branching.model.model_id,
+                    model_version=branching.model.version,
+                    applicable=True,
+                    structural_score=0,
+                    structural_score_max=0,
+                    rank=1,
+                    reasons=("branching fixture applies",),
+                    rejection_causes=(),
+                ),
+            ),
+            trajectories=(ensemble,),
+            held_out_scores=interval_scores,
+        )
+    )
+
+    assert "mean_error=" in interval_text
+    assert "mean_absolute_error=" in interval_text
+    assert "mean_squared_error=" in interval_text
+    assert "root_mean_squared_error=" in interval_text
+    assert "nominal_coverage=0.5" in interval_text
+    assert "covered=" in interval_text
+
+
+def test_report_requires_every_model_to_have_one_applicability_decision() -> None:
+    """Omitting a competing model's decision must not leave it unexplained."""
+    from pi_engine.reporting.report import build_prediction_report
+
+    inputs = _linear_report_inputs()
+    inputs["applicability"] = inputs["applicability"][:1]
+
+    with pytest.raises(ValueError, match="exactly one applicability decision"):
+        build_prediction_report(**inputs)
+
+
+def test_report_rejects_trajectory_for_a_rejected_model() -> None:
+    """A rejected model cannot silently retain a prediction artifact."""
+    from pi_engine.reporting.report import build_prediction_report
+
+    inputs = _linear_report_inputs()
+    accepted = inputs["applicability"][0]
+    inputs["applicability"] = (
+        accepted.model_copy(update={"applicable": False, "rank": None}),
+        *inputs["applicability"][1:],
+    )
+
+    with pytest.raises(ValueError, match="applicable decisions"):
+        build_prediction_report(**inputs)

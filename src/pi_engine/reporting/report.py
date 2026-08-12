@@ -14,7 +14,7 @@ from pi_engine.analysis.residuals import ResidualAnalysis
 from pi_engine.evaluation.scoring import ForecastScoreReport
 from pi_engine.registry.applicability import ApplicabilityResult
 from pi_engine.schemas.case import Case
-from pi_engine.schemas.common import Confidence
+from pi_engine.schemas.common import Confidence, Provenance
 from pi_engine.schemas.model import ExplicitModel
 from pi_engine.schemas.trajectory import Trajectory, TrajectoryEnsemble
 
@@ -28,9 +28,7 @@ Identifiability = Literal[
 ]
 
 
-class PredictionReport(BaseModel):
-    """A structured, provenance-retaining view of available prediction evidence."""
-
+class _ImmutableReportSchema(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,
@@ -38,8 +36,27 @@ class PredictionReport(BaseModel):
         revalidate_instances="always",
     )
 
+
+class StateConfidenceAssessment(_ImmutableReportSchema):
+    """A caller assessment with retained confidence semantics and source."""
+
+    confidence: Confidence
+    provenance: Provenance
+
+
+class ObservabilityWarning(_ImmutableReportSchema):
+    """A source-bound statement of an observation limitation."""
+
+    message: str = Field(min_length=1)
+    provenance: Provenance
+
+
+class PredictionReport(_ImmutableReportSchema):
+    """A structured, provenance-retaining view of available prediction evidence."""
+
     case: Case
-    state_confidence: Confidence
+    provenance: Provenance
+    state_confidence: StateConfidenceAssessment
     models: tuple[ExplicitModel, ...]
     applicability: tuple[ApplicabilityResult, ...]
     trajectories: tuple[PredictionArtifact, ...] = ()
@@ -47,16 +64,9 @@ class PredictionReport(BaseModel):
     spread: tuple[SpreadAnalysis, ...] = ()
     closure: tuple[ClosureAnalysis, ...] = ()
     residuals: tuple[ResidualAnalysis, ...] = ()
-    observability_warnings: tuple[str, ...] = ()
+    observability_warnings: tuple[ObservabilityWarning, ...] = ()
     held_out_scores: ForecastScoreReport | None = None
     identifiability: Identifiability
-
-    @field_validator("observability_warnings")
-    @classmethod
-    def warnings_must_be_nonempty(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if any(not item for item in value):
-            raise ValueError("observability warnings must be nonempty")
-        return value
 
     @model_validator(mode="after")
     def validate_identity_alignment(self) -> "PredictionReport":
@@ -69,8 +79,10 @@ class PredictionReport(BaseModel):
         )
         if len(applicability_keys) != len(set(applicability_keys)):
             raise ValueError("applicability identities must be unique")
-        if set(applicability_keys) - set(model_keys):
-            raise ValueError("applicability results must reference retained models")
+        if set(applicability_keys) != set(model_keys):
+            raise ValueError(
+                "each retained model requires exactly one applicability decision"
+            )
 
         expected_identifiability: Identifiability = (
             IDENTIFIED_MODEL_CONDITIONED
@@ -82,12 +94,13 @@ class PredictionReport(BaseModel):
 
         _validate_artifacts(
             self.case.case_id,
-            set(model_keys),
+            _applicable_keys(self.applicability),
             self.trajectories,
             role="trajectory",
         )
-        _validate_analyses(self.case.case_id, set(model_keys), self)
-        _validate_residuals(self.case.case_id, set(model_keys), self.residuals)
+        applicable_keys = _applicable_keys(self.applicability)
+        _validate_analyses(self.case.case_id, applicable_keys, self)
+        _validate_residuals(self.case.case_id, applicable_keys, self.residuals)
         _validate_scores(self.case.case_id, self.trajectories, self.held_out_scores)
         return self
 
@@ -95,7 +108,8 @@ class PredictionReport(BaseModel):
 def build_prediction_report(
     *,
     case: Case,
-    state_confidence: Confidence,
+    provenance: Provenance,
+    state_confidence: StateConfidenceAssessment,
     models: Sequence[ExplicitModel] = (),
     applicability: Sequence[ApplicabilityResult] = (),
     trajectories: Sequence[PredictionArtifact] = (),
@@ -103,7 +117,7 @@ def build_prediction_report(
     spread: Sequence[SpreadAnalysis] = (),
     closure: Sequence[ClosureAnalysis] = (),
     residuals: Sequence[ResidualAnalysis] = (),
-    observability_warnings: Sequence[str] = (),
+    observability_warnings: Sequence[ObservabilityWarning] = (),
     held_out_scores: ForecastScoreReport | None = None,
 ) -> PredictionReport:
     """Build a report without selecting a model or combining its evidence."""
@@ -116,6 +130,7 @@ def build_prediction_report(
     )
     return PredictionReport(
         case=case,
+        provenance=provenance,
         state_confidence=state_confidence,
         models=model_records,
         applicability=applicability_records,
@@ -138,13 +153,20 @@ def render_prediction_report(report: PredictionReport) -> str:
         f"Case: {validated.case.case_id} — {validated.case.title}",
         f"Domain: {validated.case.domain}",
         f"Prediction cutoff: {validated.case.prediction_cutoff.isoformat()}",
+        _render_provenance("Report provenance", validated.provenance),
         f"Identifiability: {validated.identifiability}",
         _render_confidence(validated.state_confidence),
+        "Canonical state-space:",
+        *_render_state_space(validated.case),
+        "Graph nodes:",
+        *_render_graph_nodes(validated.case),
+        "Graph relationships:",
+        *_render_graph_relationships(validated.case),
         _render_state_uncertainty(validated.case),
         "Model uncertainty:",
         *_render_model_uncertainty(validated.models),
         "Observability warnings:",
-        *_bullets(validated.observability_warnings, "none declared"),
+        *_render_observability_warnings(validated.observability_warnings),
         "Model applicability:",
         *_render_applicability(validated.applicability),
         "Model-conditioned trajectories:",
@@ -170,9 +192,19 @@ def _artifact_key(artifact: PredictionArtifact) -> tuple[str, str]:
     return artifact.model_id, artifact.model_version
 
 
+def _applicable_keys(
+    results: Sequence[ApplicabilityResult],
+) -> set[tuple[str, str]]:
+    return {
+        (result.model_id, result.model_version)
+        for result in results
+        if result.applicable
+    }
+
+
 def _validate_artifacts(
     case_id: str,
-    model_keys: set[tuple[str, str]],
+    applicable_keys: set[tuple[str, str]],
     artifacts: Sequence[PredictionArtifact],
     *,
     role: str,
@@ -180,36 +212,38 @@ def _validate_artifacts(
     for artifact in artifacts:
         if artifact.case_id != case_id:
             raise ValueError(f"{role} case_id must match report case")
-        if _artifact_key(artifact) not in model_keys:
-            raise ValueError(f"{role} must reference a retained model")
+        if _artifact_key(artifact) not in applicable_keys:
+            raise ValueError(f"{role} must refer only to applicable decisions")
 
 
 def _validate_analyses(
     case_id: str,
-    model_keys: set[tuple[str, str]],
+    applicable_keys: set[tuple[str, str]],
     report: PredictionReport,
 ) -> None:
     for analysis in report.convergence:
-        _validate_artifacts(case_id, model_keys, (analysis.source,), role="convergence")
+        _validate_artifacts(
+            case_id, applicable_keys, (analysis.source,), role="convergence"
+        )
     for analysis in report.spread:
-        _validate_artifacts(case_id, model_keys, (analysis.source,), role="spread")
+        _validate_artifacts(case_id, applicable_keys, (analysis.source,), role="spread")
     for analysis in report.closure:
         _validate_artifacts(
-            case_id, model_keys, (analysis.source.source,), role="closure"
+            case_id, applicable_keys, (analysis.source.source,), role="closure"
         )
 
 
 def _validate_residuals(
     case_id: str,
-    model_keys: set[tuple[str, str]],
+    applicable_keys: set[tuple[str, str]],
     residuals: Sequence[ResidualAnalysis],
 ) -> None:
     for analysis in residuals:
         residual = analysis.residual
         if residual.case_id != case_id:
             raise ValueError("residual case_id must match report case")
-        if (residual.model_id, residual.model_version) not in model_keys:
-            raise ValueError("residual must reference a retained model")
+        if (residual.model_id, residual.model_version) not in applicable_keys:
+            raise ValueError("residual must refer only to applicable decisions")
 
 
 def _validate_scores(
@@ -241,9 +275,61 @@ def _prediction_artifact_identity(artifact: PredictionArtifact) -> tuple[str, st
     return "trajectory", artifact.trajectory_id
 
 
-def _render_confidence(confidence: Confidence) -> str:
+def _render_provenance(label: str, provenance: Provenance) -> str:
+    reference = f"; reference={provenance.reference}" if provenance.reference else ""
+    return (
+        f"{label}: source={provenance.source}; "
+        f"observed_at={provenance.observed_at.isoformat()}{reference}"
+    )
+
+
+def _render_confidence(assessment: StateConfidenceAssessment) -> str:
+    confidence = assessment.confidence
     basis = f" (basis: {confidence.basis})" if confidence.basis else ""
-    return f"State confidence: {confidence.score}{basis}"
+    return "\n".join(
+        (
+            f"State confidence: {confidence.score}{basis}",
+            _render_provenance("State confidence provenance", assessment.provenance),
+        )
+    )
+
+
+def _render_state_space(case: Case) -> tuple[str, ...]:
+    lines = []
+    components = (
+        ("observed", case.state.observed),
+        ("latent", case.state.latent),
+        ("uncertainty", case.state.uncertainty),
+        ("boundary", case.state.boundary),
+    )
+    for variable in case.canonical_variables:
+        values = "; ".join(
+            f"{name}={mapping.get(variable.name, 'unavailable')!r}"
+            for name, mapping in components
+        )
+        lines.append(f"- {variable.name} [{variable.unit}]: {values}")
+    return tuple(lines)
+
+
+def _render_graph_nodes(case: Case) -> tuple[str, ...]:
+    return tuple(
+        f"- {node.node_id}: variables={', '.join(node.variable_refs)}"
+        for node in case.graph.nodes
+    ) or ("- none retained",)
+
+
+def _render_graph_relationships(case: Case) -> tuple[str, ...]:
+    lines = [
+        f"- {edge.source} -> {edge.target}: coupling_type={edge.coupling_type}; "
+        f"strength={edge.strength!r}; effective_proximity={edge.effective_proximity!r}"
+        for edge in case.graph.edges
+    ]
+    lines.extend(
+        f"- {relationship.node_id} -> boundary:{relationship.variable_ref}: "
+        f"relationship_type={relationship.relationship_type}"
+        for relationship in case.graph.boundary_relationships
+    )
+    return tuple(lines) or ("- none retained",)
 
 
 def _render_state_uncertainty(case: Case) -> str:
@@ -276,8 +362,21 @@ def _render_model_uncertainty(
     return tuple(lines) or ("- no model uncertainty records retained",)
 
 
-def _bullets(values: Sequence[str], empty: str) -> tuple[str, ...]:
-    return tuple(f"- {item}" for item in values) or (f"- {empty}",)
+def _render_observability_warnings(
+    warnings: Sequence[ObservabilityWarning],
+) -> tuple[str, ...]:
+    lines = []
+    for warning in warnings:
+        reference = (
+            f"; reference={warning.provenance.reference}"
+            if warning.provenance.reference
+            else ""
+        )
+        lines.append(
+            f"- {warning.message}; source={warning.provenance.source}; "
+            f"observed_at={warning.provenance.observed_at.isoformat()}{reference}"
+        )
+    return tuple(lines) or ("- none declared",)
 
 
 def _render_applicability(
@@ -379,17 +478,57 @@ def _render_scores(scores: ForecastScoreReport | None) -> tuple[str, ...]:
     lines = ["Held-out scores: REVEALED"]
     for artifact in scores.artifacts:
         identity = f"{artifact.model_id}@{artifact.model_version}"
-        metrics = "; ".join(
-            f"{metric.variable}: mean_absolute_error={metric.mean_absolute_error}"
+        lines.append(f"- {identity}: artifact={artifact.artifact_id}")
+        lines.extend(
+            f"  continuous point {point.outcome_id}: variable={point.variable}; "
+            f"forecast={point.forecast}; observed={point.observed}; "
+            f"error={point.error}; absolute_error={point.absolute_error}; "
+            f"squared_error={point.squared_error}"
+            for point in artifact.continuous_points
+        )
+        lines.extend(
+            f"  continuous {metric.variable}: count={metric.count}; "
+            f"mean_error={metric.mean_error}; "
+            f"mean_absolute_error={metric.mean_absolute_error}; "
+            f"mean_squared_error={metric.mean_squared_error}; "
+            f"root_mean_squared_error={metric.root_mean_squared_error}"
             for metric in artifact.continuous_metrics
-        ) or "no continuous metrics retained"
-        lines.append(f"- {identity}: {metrics}")
+        )
+        lines.extend(
+            f"  probability point {point.outcome_id}: variable={point.variable}; "
+            f"predicted_probability={point.predicted_probability}; label={point.label}; "
+            f"brier_score={point.brier_score}; log_score={_render_log_score(point.log_score)}"
+            for point in artifact.probability_points
+        )
+        lines.extend(
+            f"  probability {metric.variable}: count={metric.count}; "
+            f"mean_brier_score={metric.mean_brier_score}; "
+            f"mean_log_score={_render_log_score(metric.mean_log_score)}"
+            for metric in artifact.probability_metrics
+        )
+        lines.extend(
+            f"  interval {interval.outcome_id}: variable={interval.variable}; "
+            f"nominal_coverage={interval.nominal_coverage}; lower={interval.lower}; "
+            f"upper={interval.upper}; observed={interval.observed}; "
+            f"covered={interval.covered}; method={interval.interval_method}"
+            for interval in artifact.intervals
+        )
     return tuple(lines)
+
+
+def _render_log_score(value: object) -> str:
+    if value is None:
+        return "not retained"
+    kind = getattr(value, "kind")
+    score = getattr(value, "value")
+    return f"{kind}({score})"
 
 
 __all__ = [
     "IDENTIFIED_MODEL_CONDITIONED",
+    "ObservabilityWarning",
     "PredictionReport",
+    "StateConfidenceAssessment",
     "UNIDENTIFIABLE_FROM_AVAILABLE_EVIDENCE",
     "build_prediction_report",
     "render_prediction_report",
