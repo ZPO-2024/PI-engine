@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pi-engine"
+version = "0.1.0"
+description = "Inspectable observational and predictive analysis schemas"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "pydantic>=2.0",
+    "tzdata>=2025.2",
+]
+
+[project.scripts]
+pi-engine = "pi_engine.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

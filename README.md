@@ -28,3 +28,35 @@ The v0.1 goal is to normalize cases into explicit, inspectable state-space and g
 ## Intended implementation stack
 
 Initial implementation should remain lightweight and inspectable: Python, Pydantic/JSON Schema, NumPy/SciPy, NetworkX, pandas, pytest, and Hypothesis. Avoid adding ML frameworks until deterministic and similarity-based routing are demonstrably insufficient.
+
+## Command line
+
+`pi-engine` (or `python -m pi_engine.cli`) runs synthetic cases and negative controls end to end:
+
+```
+pi-engine list
+pi-engine run linear_convergence --horizon 3 --artifact run.json
+pi-engine report --artifact run.json
+pi-engine reveal --artifact run.json
+```
+
+`run` is the only command that simulates. It saves a signed run artifact (a
+checksummed JSON envelope) rather than printing a report. `report` and
+`reveal` always replay that saved artifact — they never re-simulate — so a
+rendered report reflects exactly what was run, and a tampered artifact file
+fails a checksum check (`run artifact integrity check failed`) instead of
+silently rendering different numbers.
+
+## Known limitations (v0.1)
+
+- Actual implementation needed only NumPy and Pydantic; SciPy, NetworkX, and
+  pandas from the intended stack above were never required at this scope.
+  Left as a forward-looking list, not a claim of current use.
+- No Hypothesis/property-based tests exist yet, despite Hypothesis being
+  named in the intended stack. All 524 tests are example-based. Property
+  tests for the schema and numeric-analysis layers are the highest-value
+  addition before relying on this for anything beyond the synthetic
+  fixtures.
+- `report`/`reveal` require a saved run artifact; there is no longer a
+  "simulate and print a report in one step" path. This is a deliberate
+  provenance guarantee (see Command line, above), not an oversight.
